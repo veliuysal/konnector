@@ -77,8 +77,9 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "logs" => cmd_logs(&args[1..]),
         "install" => cmd_install(&args[1..]),
         "update" | "upgrade" => cmd_update(&args[1..]),
-        "remove" | "uninstall" => cmd_remove(),
-        "purge" => cmd_purge(),
+        "remove" => cmd_remove(),
+        "uninstall" => cmd_uninstall(),
+        "purge" => cmd_uninstall(),
         "init" => cmd_init(),
         "tags" => cmd_tags(),
         "releases" => cmd_releases(),
@@ -118,6 +119,7 @@ Release:
   konnector releases
   konnector current
   konnector remove
+  konnector uninstall
   konnector purge
 
 Build:
@@ -748,6 +750,11 @@ fn cmd_tags() -> Result<(), String> {
     Ok(())
 }
 
+fn package_installed() -> bool {
+    run_output("dpkg-query", &["-W", "-f=${Status}", PACKAGE])
+        .is_ok_and(|status| status.contains("install ok installed"))
+}
+
 fn cmd_remove() -> Result<(), String> {
     require_root("remove")?;
     run_command("systemctl", &["stop", SERVICE]).ok();
@@ -758,14 +765,33 @@ fn cmd_remove() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_purge() -> Result<(), String> {
-    require_root("purge")?;
-    cmd_remove()?;
+fn cmd_uninstall() -> Result<(), String> {
+    require_root("uninstall")?;
+    run_command("systemctl", &["stop", SERVICE]).ok();
+    run_command("systemctl", &["disable", SERVICE]).ok();
+    if package_installed() {
+        run_command(
+            "apt-get",
+            &[
+                "purge",
+                "-y",
+                "-o",
+                "DEBIAN_FRONTEND=noninteractive",
+                PACKAGE,
+            ],
+        )?;
+    } else {
+        fs::remove_file("/lib/systemd/system/konnector.service").ok();
+        run_command("systemctl", &["daemon-reload"]).ok();
+    }
     fs::remove_dir_all(APP_DIR).ok();
+    fs::remove_dir_all("/etc/konnector").ok();
+    fs::remove_dir_all("/etc/ssl/konnector").ok();
     fs::remove_file("/etc/konnector.env").ok();
     fs::remove_file("/etc/sudoers.d/konnector-deploy").ok();
     fs::remove_file("/usr/bin/konnector").ok();
-    println!("Konnector purged.");
+    run_command("deluser", &["--system", "konnector"]).ok();
+    println!("Konnector uninstalled.");
     Ok(())
 }
 
@@ -944,6 +970,7 @@ mod tests {
     fn detects_admin_commands() {
         assert!(is_admin_command(&["status".to_owned()]));
         assert!(is_admin_command(&["install".to_owned()]));
+        assert!(is_admin_command(&["uninstall".to_owned()]));
         assert!(is_admin_command(&["tags".to_owned()]));
         assert!(is_admin_command(&["build-deb".to_owned()]));
         assert!(!is_admin_command(&["deploy".to_owned()]));

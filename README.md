@@ -64,7 +64,11 @@ konnector status
 konnector health
 konnector logs --follow
 konnector tags
+sudo konnector uninstall
 ```
+
+`uninstall` stops the service, removes `/opt/konnector`, config files, and the
+`konnector` system user. If installed from `.deb`, it also runs `apt purge`.
 
 ## Development
 
