@@ -1,0 +1,24 @@
+domains:
+  - example.com
+  - www.example.com
+
+proxy:
+  mode: direct
+  upstream:
+    instance: 127.0.0.1:8080
+
+redirects:
+  - from: /home
+    to: /
+    behavior: redirect
+    match: exact
+
+internal_routes: []
+
+access:
+  mode: all
+
+cache:
+  enabled: false
+
+forwarding: direct

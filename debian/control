@@ -1,0 +1,27 @@
+Source: konnector
+Section: web
+Priority: optional
+Maintainer: Konnector Maintainers <konnector@example.com>
+Build-Depends: debhelper (>= 13),
+               cargo,
+               rustc,
+               libssl-dev,
+               pkg-config,
+               clang,
+               cmake,
+               perl
+Standards-Version: 4.6.2
+Homepage: https://github.com/veliuysal/konnector
+Rules-Requires-Root: no
+
+Package: konnector
+Architecture: amd64
+Depends: ${misc:Depends},
+         adduser,
+         systemd,
+         curl,
+         ca-certificates,
+         gnupg
+Description: Konnector reverse proxy
+ High-performance domain reverse proxy built on Cloudflare Pingora.
+ Ships with YAML site configuration, TLS watching, and systemd integration.

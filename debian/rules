@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export CARGO_TARGET_DIR = $(CURDIR)/target
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	cargo clean
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+	cargo test --locked
+
+override_dh_auto_install:
+	install -d debian/konnector/usr/bin
+	install -d debian/konnector/lib/systemd/system
+	install -d debian/konnector/usr/share/konnector/configs
+	install -d debian/konnector/usr/share/doc/konnector
+	install -m 755 target/release/konnector debian/konnector/usr/bin/konnector
+	install -m 644 debian/konnector.service debian/konnector/lib/systemd/system/konnector.service
+	install -m 644 debian/konnector.env.example debian/konnector/usr/share/konnector/env.example
+	cp configs/*.yaml debian/konnector/usr/share/konnector/configs/
+	install -m 644 README.md debian/konnector/usr/share/doc/konnector/README.md
+
+override_dh_shlibdeps:
+	:

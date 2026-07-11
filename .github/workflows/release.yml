@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: konnector
+
+jobs:
+  release:
+    name: Build package and publish release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo files
+        uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes debhelper cargo rustc libssl-dev pkg-config clang cmake perl
+      - name: Build Debian package
+        run: |
+          chmod +x debian/rules
+          dpkg-buildpackage -us -uc -b
+      - name: Build release tarball
+        run: |
+          cargo build --release --locked --bin "${BINARY_NAME}"
+          mkdir -p artifact
+          cp "target/release/${BINARY_NAME}" "artifact/${BINARY_NAME}"
+          cp -R configs artifact/configs
+          chmod +x "artifact/${BINARY_NAME}"
+          tar -C artifact -czf "${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz" "${BINARY_NAME}" configs
+          sha256sum "${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz" > "${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz.sha256"
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ../konnector_*_amd64.deb
+            ${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz
+            ${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz.sha256
+          generate_release_notes: true
