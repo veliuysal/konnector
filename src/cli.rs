@@ -9,6 +9,7 @@ use std::{
 };
 
 const APP_DIR: &str = "/opt/konnector";
+const DEFAULT_CONFIG_DIR: &str = "/opt/konnector/current/configs";
 const SERVICE: &str = "konnector.service";
 const PACKAGE: &str = "konnector";
 const HEALTH_URL: &str = "http://127.0.0.1/_health";
@@ -108,7 +109,7 @@ Service:
   konnector logs [--follow] [--lines N]
 
 Release:
-  konnector install [tag|archive.tar.gz|release-url]
+  konnector install [tag|package.deb|archive.tar.gz|release-url]
   konnector install --tag v0.1.0
   konnector update [tag]
   konnector upgrade [tag]
@@ -248,7 +249,48 @@ fn ensure_layout() -> Result<(), String> {
         run_command("chmod", &["640", "/etc/konnector.env"])?;
         run_command("chown", &["root:konnector", "/etc/konnector.env"])?;
     }
+    ensure_config_dir_env()?;
     ensure_sudoers()
+}
+
+fn ensure_config_dir_env() -> Result<(), String> {
+    let path = Path::new("/etc/konnector.env");
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read /etc/konnector.env: {error}"))?;
+    if contents.lines().any(|line| line.starts_with("CONFIG_DIR=")) {
+        return Ok(());
+    }
+    let mut updated = contents;
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&format!("CONFIG_DIR={DEFAULT_CONFIG_DIR}\n"));
+    fs::write(path, updated)
+        .map_err(|error| format!("cannot update /etc/konnector.env: {error}"))?;
+    Ok(())
+}
+
+fn copy_configs_to(release_dir: &Path) -> Result<(), String> {
+    let destination = release_dir.join("configs");
+    if Path::new("/usr/share/konnector/configs").is_dir() {
+        run_command(
+            "cp",
+            &[
+                "-a",
+                "/usr/share/konnector/configs/.",
+                &destination.display().to_string(),
+            ],
+        )?;
+        return Ok(());
+    }
+    if Path::new("configs").is_dir() {
+        run_command(
+            "cp",
+            &["-a", "configs/.", &destination.display().to_string()],
+        )?;
+        return Ok(());
+    }
+    Err("configs directory not found in package or release".into())
 }
 
 fn install_service_file() -> Result<(), String> {
@@ -403,21 +445,29 @@ fn github_api_release(path: &str) -> Result<GithubRelease, String> {
     serde_json::from_str(&body).map_err(|error| format!("invalid GitHub release response: {error}"))
 }
 
-fn release_tarball_url(release: GithubRelease) -> Result<String, String> {
+fn release_package_url(release: GithubRelease) -> Result<String, String> {
+    if let Some(url) = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.starts_with("konnector-v") && asset.name.ends_with(".tar.gz"))
+        .map(|asset| asset.browser_download_url.clone())
+    {
+        return Ok(url);
+    }
     release
         .assets
-        .into_iter()
-        .find(|asset| asset.name.starts_with("konnector-v") && asset.name.ends_with(".tar.gz"))
-        .map(|asset| asset.browser_download_url)
-        .ok_or_else(|| format!("no release tarball found for {}", release.tag_name))
+        .iter()
+        .find(|asset| asset.name.starts_with("konnector_") && asset.name.ends_with("_amd64.deb"))
+        .map(|asset| asset.browser_download_url.clone())
+        .ok_or_else(|| format!("no release package found for {}", release.tag_name))
 }
 
-fn latest_release_tarball_url() -> Result<String, String> {
-    release_tarball_url(github_api_release("/releases/latest")?)
+fn latest_release_package_url() -> Result<String, String> {
+    release_package_url(github_api_release("/releases/latest")?)
 }
 
-fn release_tarball_url_for_tag(tag: &str) -> Result<String, String> {
-    release_tarball_url(github_api_release(&format!(
+fn release_package_url_for_tag(tag: &str) -> Result<String, String> {
+    release_package_url(github_api_release(&format!(
         "/releases/tags/{}",
         normalize_tag(tag)
     ))?)
@@ -432,10 +482,104 @@ fn normalize_tag(tag: &str) -> String {
     }
 }
 
-fn is_release_archive(reference: &str) -> bool {
+fn is_local_package(reference: &str) -> bool {
     reference.ends_with(".tar.gz")
         || reference.ends_with(".tgz")
+        || reference.ends_with(".deb")
         || Path::new(reference).exists()
+}
+
+fn resolve_release_source(reference: Option<&str>) -> Result<String, String> {
+    let Some(reference) = reference else {
+        return latest_release_package_url();
+    };
+    if reference.starts_with("http://") || reference.starts_with("https://") {
+        return Ok(reference.to_owned());
+    }
+    if is_local_package(reference) {
+        return Ok(reference.to_owned());
+    }
+    release_package_url_for_tag(reference)
+}
+
+fn is_deb_package(source: &str) -> bool {
+    source.ends_with(".deb")
+        || source.contains("/konnector_")
+            && source.contains("_amd64.deb")
+}
+
+fn install_deb_package(path: &Path) -> Result<(), String> {
+    run_command("apt-get", &["update"])?;
+    run_command(
+        "apt-get",
+        &[
+            "install",
+            "-y",
+            "-o",
+            "DEBIAN_FRONTEND=noninteractive",
+            path.to_str().ok_or("invalid deb path")?,
+        ],
+    )
+}
+
+fn install_package(source: &str) -> Result<(), String> {
+    if source.starts_with("http://") || source.starts_with("https://") || Path::new(source).is_file() {
+        if is_deb_package(source) {
+            let package = temp_path("konnector-package");
+            download_file(source, &package)?;
+            return install_deb_package(&package);
+        }
+    } else if is_deb_package(source) {
+        return install_deb_package(Path::new(source));
+    }
+    install_tarball(source)
+}
+
+fn install_tarball(source: &str) -> Result<(), String> {
+    ensure_layout()?;
+    install_service_file()?;
+    let release_id = format!("{}-{}", utc_timestamp(), short_hash(source));
+    let release_dir = PathBuf::from(format!("{APP_DIR}/releases/{release_id}"));
+    let archive = temp_path("konnector-archive");
+    download_file(source, &archive)?;
+    verify_checksum(source)?;
+    fs::create_dir_all(&release_dir)
+        .map_err(|error| format!("cannot create release directory: {error}"))?;
+    run_command(
+        "tar",
+        &[
+            "-xzf",
+            archive.to_str().ok_or("invalid archive path")?,
+            "-C",
+            &release_dir.display().to_string(),
+        ],
+    )?;
+    if !release_dir.join("configs").is_dir() {
+        return Err(format!(
+            "release archive is missing configs/: {}",
+            release_dir.display()
+        ));
+    }
+    run_command(
+        "chmod",
+        &[
+            "755",
+            release_dir
+                .join(PACKAGE)
+                .to_str()
+                .ok_or("invalid binary path")?,
+        ],
+    )?;
+    run_command(
+        "chown",
+        &[
+            "-R",
+            "konnector:konnector",
+            &release_dir.display().to_string(),
+        ],
+    )?;
+    fs::remove_file(archive).ok();
+    activate_release(&release_dir)
 }
 
 fn parse_release_reference(args: &[String]) -> Result<Option<String>, String> {
@@ -461,60 +605,6 @@ fn parse_release_reference(args: &[String]) -> Result<Option<String>, String> {
         index += 1;
     }
     Ok(reference)
-}
-
-fn resolve_release_source(reference: Option<&str>) -> Result<String, String> {
-    let Some(reference) = reference else {
-        return latest_release_tarball_url();
-    };
-    if reference.starts_with("http://") || reference.starts_with("https://") {
-        return Ok(reference.to_owned());
-    }
-    if is_release_archive(reference) {
-        return Ok(reference.to_owned());
-    }
-    release_tarball_url_for_tag(reference)
-}
-
-fn install_release(source: &str) -> Result<(), String> {
-    ensure_layout()?;
-    install_service_file()?;
-    let release_id = format!("{}-{}", utc_timestamp(), short_hash(source));
-    let release_dir = PathBuf::from(format!("{APP_DIR}/releases/{release_id}"));
-    let archive = temp_path("konnector-archive");
-    download_file(source, &archive)?;
-    verify_checksum(source)?;
-    fs::create_dir_all(&release_dir)
-        .map_err(|error| format!("cannot create release directory: {error}"))?;
-    run_command(
-        "tar",
-        &[
-            "-xzf",
-            archive.to_str().ok_or("invalid archive path")?,
-            "-C",
-            &release_dir.display().to_string(),
-        ],
-    )?;
-    run_command(
-        "chmod",
-        &[
-            "755",
-            release_dir
-                .join(PACKAGE)
-                .to_str()
-                .ok_or("invalid binary path")?,
-        ],
-    )?;
-    run_command(
-        "chown",
-        &[
-            "-R",
-            "konnector:konnector",
-            &release_dir.display().to_string(),
-        ],
-    )?;
-    fs::remove_file(archive).ok();
-    activate_release(&release_dir)
 }
 
 fn verify_checksum(source: &str) -> Result<(), String> {
@@ -616,8 +706,10 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     let reference = parse_release_reference(args)?;
     let source = resolve_release_source(reference.as_deref())?;
     println!("Installing from: {source}");
-    install_release(&source)?;
-    run_command("systemctl", &["enable", SERVICE])?;
+    install_package(&source)?;
+    if service_installed() {
+        run_command("systemctl", &["enable", SERVICE]).ok();
+    }
     println!("Konnector installed.");
     Ok(())
 }
@@ -627,7 +719,7 @@ fn cmd_update(args: &[String]) -> Result<(), String> {
     let reference = parse_release_reference(args)?;
     let source = resolve_release_source(reference.as_deref())?;
     println!("Updating from: {source}");
-    install_release(&source)?;
+    install_package(&source)?;
     println!("Konnector updated.");
     Ok(())
 }
@@ -689,21 +781,7 @@ fn cmd_init() -> Result<(), String> {
             .map_err(|error| format!("cannot create release directory: {error}"))?;
         fs::copy(&binary, release_dir.join(PACKAGE))
             .map_err(|error| format!("cannot install runtime binary: {error}"))?;
-        if Path::new("configs").is_dir() {
-            run_command(
-                "cp",
-                &["-a", "configs", &format!("{}/", release_dir.display())],
-            )?;
-        } else if Path::new("/usr/share/konnector/configs").is_dir() {
-            run_command(
-                "cp",
-                &[
-                    "-a",
-                    "/usr/share/konnector/configs",
-                    &format!("{}/", release_dir.display()),
-                ],
-            )?;
-        }
+        copy_configs_to(&release_dir)?;
         run_command(
             "chown",
             &[
@@ -879,9 +957,25 @@ mod tests {
     }
 
     #[test]
-    fn classifies_release_archives() {
-        assert!(is_release_archive("konnector-v0.1.0.tar.gz"));
-        assert!(!is_release_archive("v0.1.0"));
+    fn classifies_local_packages() {
+        assert!(is_local_package("konnector-v0.1.0.tar.gz"));
+        assert!(is_local_package("konnector_0.1.0-1_amd64.deb"));
+        assert!(!is_local_package("v0.1.0"));
+    }
+
+    #[test]
+    fn selects_deb_when_tarball_missing() {
+        let release = GithubRelease {
+            tag_name: "v0.1.0".to_owned(),
+            assets: vec![GithubAsset {
+                name: "konnector_0.1.0-1_amd64.deb".to_owned(),
+                browser_download_url: "https://example.com/konnector.deb".to_owned(),
+            }],
+        };
+        assert_eq!(
+            release_package_url(release).unwrap(),
+            "https://example.com/konnector.deb"
+        );
     }
 
     #[test]

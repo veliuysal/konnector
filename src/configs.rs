@@ -210,9 +210,17 @@ pub fn load_sites() -> Result<Vec<SiteConfig>, String> {
 }
 
 pub fn config_dir() -> PathBuf {
-    env::var("CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("configs"))
+    if let Ok(dir) = env::var("CONFIG_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let production = PathBuf::from("/opt/konnector/current/configs");
+    if production.is_dir() {
+        return production;
+    }
+    PathBuf::from("configs")
 }
 
 pub(crate) fn load_sites_from(directory: &Path) -> Result<Vec<SiteConfig>, String> {

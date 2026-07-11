@@ -40,11 +40,20 @@ jobs:
           chmod +x "artifact/${BINARY_NAME}"
           tar -C artifact -czf "${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz" "${BINARY_NAME}" configs
           sha256sum "${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz" > "${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz.sha256"
+      - name: Verify release artifacts
+        run: |
+          test -f "../konnector_"*"_amd64.deb"
+          test -f "konnector-${{ github.ref_name }}.tar.gz"
+          test -f "konnector-${{ github.ref_name }}.tar.gz.sha256"
+          ls -la ../*.deb konnector-${{ github.ref_name }}.tar.gz*
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
           files: |
             ../konnector_*_amd64.deb
-            ${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz
-            ${BINARY_NAME}-${GITHUB_REF_NAME}.tar.gz.sha256
+            konnector-${{ github.ref_name }}.tar.gz
+            konnector-${{ github.ref_name }}.tar.gz.sha256
           generate_release_notes: true
