@@ -1,3 +1,6 @@
 /target
 *.pid
 *.sock
+
+# Keep lockfile for reproducible CI and release builds.
+!Cargo.lock
