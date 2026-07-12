@@ -287,6 +287,7 @@ mod tests {
             host: None,
             ca_path: None,
             base_path: String::new(),
+            http_version: crate::configs::HttpVersion::Auto,
         };
         assert_eq!(upstream_host_header(&upstream), "127.0.0.1:3000");
         assert!(active_prefix(&upstream).is_none());

@@ -1,9 +1,11 @@
-use crate::proxy::{reload_routing, SharedRouting};
 use crate::configs;
+use crate::proxy::{reload_routing, SharedRouting};
+use crate::tcp_proxy::{self, TcpProxyManager};
 use notify::{RecursiveMode, Watcher};
+use std::sync::Arc;
 use std::{sync::mpsc, thread, time::Duration};
 
-pub fn start(routing: SharedRouting) {
+pub fn start(routing: SharedRouting, tcp_manager: Arc<TcpProxyManager>) {
     let directory = configs::config_dir();
     thread::Builder::new()
         .name("config-watcher".to_owned())
@@ -31,6 +33,7 @@ pub fn start(routing: SharedRouting) {
                 while receiver.try_recv().is_ok() {}
 
                 reload_routing(&routing);
+                tcp_proxy::reload(&tcp_manager);
             }
         })
         .unwrap_or_else(|error| panic!("cannot start config watcher: {error}"));

@@ -1,13 +1,28 @@
 use crate::{
-    configs::LogLevel,
+    configs::{LogLevel, UpstreamConfig},
     proxy::{RequestContext, SiteRuntime},
 };
 use pingora::prelude::*;
-use std::time::Instant;
+use std::{net::SocketAddr, time::{Duration, Instant}};
 
-pub fn log_level_for(ctx: &RequestContext, sites: &[SiteRuntime], default: LogLevel) -> LogLevel {
-    ctx.site
-        .and_then(|index| sites.get(index))
+pub fn access_logging_enabled(level: LogLevel) -> bool {
+    level.is_enabled()
+}
+
+pub fn log_level_for(
+    ctx: &RequestContext,
+    sites: &[SiteRuntime],
+    default: LogLevel,
+    root_site: Option<usize>,
+) -> LogLevel {
+    let Some(index) = ctx.site else {
+        return default;
+    };
+    if root_site == Some(index) {
+        return default;
+    }
+    sites
+        .get(index)
         .map(|site| site.logging)
         .unwrap_or(default)
 }
@@ -17,23 +32,24 @@ pub fn log_request(
     ctx: &RequestContext,
     sites: &[SiteRuntime],
     default: LogLevel,
+    root_site: Option<usize>,
     error: Option<&Error>,
 ) {
-    if ctx.skip_access_log {
+    if ctx.skip_access_log || !ctx.proxied {
         return;
     }
 
-    let level = log_level_for(ctx, sites, default);
+    let level = log_level_for(ctx, sites, default, root_site);
+    if !level.is_enabled() {
+        return;
+    }
+
     let status = session
         .response_written()
         .map_or(0, |response| response.status.as_u16());
-    let has_error = error.is_some();
-
-    if !level.should_log(status, has_error) {
-        return;
-    }
-
     let summary = session.as_ref().request_summary();
+    let http_version = upstream_http_version(ctx, sites);
+
     if level.is_debug() {
         let upstream = upstream_summary(ctx, sites);
         let duration_ms = ctx
@@ -41,60 +57,85 @@ pub fn log_request(
             .map(|started| started.elapsed().as_millis())
             .unwrap_or(0);
         if let Some(error) = error {
-            log::debug!("{summary} -> {status} ({duration_ms}ms) upstream={upstream} error={error}");
+            log::info!(
+                "{summary} -> {status} ({duration_ms}ms) upstream={upstream} http={http_version} error={error}"
+            );
         } else {
-            log::debug!("{summary} -> {status} ({duration_ms}ms) upstream={upstream}");
+            log::info!(
+                "{summary} -> {status} ({duration_ms}ms) upstream={upstream} http={http_version}"
+            );
         }
         return;
     }
 
     if let Some(error) = error {
-        log::info!("{summary} -> {status} error={error}");
+        log::info!("{summary} -> {status} http={http_version} error={error}");
     } else {
-        log::info!("{summary} -> {status}");
+        log::info!("{summary} -> {status} http={http_version}");
     }
 }
 
-pub fn log_proxy_failure(
+pub fn log_proxy_started(
     session: &Session,
     ctx: &RequestContext,
     sites: &[SiteRuntime],
     default: LogLevel,
-    error: &Error,
+    root_site: Option<usize>,
 ) {
-    if ctx.skip_access_log {
+    if ctx.skip_access_log || !ctx.proxied {
         return;
     }
-    let level = log_level_for(ctx, sites, default);
-    if level < LogLevel::Warn {
+    let level = log_level_for(ctx, sites, default, root_site);
+    if !level.is_enabled() {
         return;
     }
-    let host = session
-        .req_header()
-        .headers
-        .get("host")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("-");
-    let path = session.req_header().uri.path();
-    log::warn!("proxy error for {host}{path}: {error}");
+    let summary = session.as_ref().request_summary();
+    let upstream = upstream_summary(ctx, sites);
+    let http_version = upstream_http_version(ctx, sites);
+    log::info!("{summary} proxy upstream={upstream} http={http_version}");
+}
+
+pub fn log_tcp_connection(
+    name: &str,
+    client: SocketAddr,
+    upstream: &str,
+    bytes_up: u64,
+    bytes_down: u64,
+    duration: Duration,
+    error: Option<&str>,
+) {
+    let duration_ms = duration.as_millis();
+    match error {
+        Some(error) => log::info!(
+            "TCP {name} {client} -> {upstream} ({duration_ms}ms) up={bytes_up} down={bytes_down} error={error}"
+        ),
+        None => log::info!(
+            "TCP {name} {client} -> {upstream} ({duration_ms}ms) up={bytes_up} down={bytes_down}"
+        ),
+    }
+}
+
+fn selected_upstream<'a>(
+    ctx: &RequestContext,
+    sites: &'a [SiteRuntime],
+) -> Option<&'a UpstreamConfig> {
+    let site_index = ctx.site?;
+    let site = sites.get(site_index)?;
+    if let Some(route_index) = ctx.internal_route {
+        return site.internal_routes.get(route_index).map(|route| &route.upstream);
+    }
+    let upstream_index = ctx.upstream?;
+    site.target.get(upstream_index)
+}
+
+fn upstream_http_version(ctx: &RequestContext, sites: &[SiteRuntime]) -> &'static str {
+    selected_upstream(ctx, sites)
+        .map(|upstream| upstream.http_version.log_label())
+        .unwrap_or("-")
 }
 
 fn upstream_summary(ctx: &RequestContext, sites: &[SiteRuntime]) -> String {
-    let Some(site_index) = ctx.site else {
-        return "-".to_owned();
-    };
-    let Some(site) = sites.get(site_index) else {
-        return "-".to_owned();
-    };
-    if let Some(route_index) = ctx.internal_route {
-        return site.internal_routes[route_index]
-            .upstream
-            .address
-            .clone();
-    }
-    let upstream_index = ctx.upstream.unwrap_or(0);
-    site.target
-        .get(upstream_index)
+    selected_upstream(ctx, sites)
         .map(|upstream| upstream.address.clone())
         .unwrap_or_else(|| "-".to_owned())
 }
@@ -103,20 +144,114 @@ impl RequestContext {
     pub fn mark_started(&mut self) {
         self.started_at = Some(Instant::now());
     }
+
+    pub fn mark_proxied(&mut self) {
+        self.proxied = true;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::configs::LogLevel;
+    use crate::configs::{HttpVersion, LogLevel, UpstreamConfig};
+    use crate::proxy::{RequestContext, SiteRuntime, UpstreamRuntime};
 
     #[test]
-    fn log_levels_filter_by_status_and_errors() {
-        assert!(!LogLevel::Off.should_log(200, false));
-        assert!(LogLevel::Error.should_log(500, false));
-        assert!(LogLevel::Error.should_log(200, true));
-        assert!(!LogLevel::Error.should_log(404, false));
-        assert!(LogLevel::Warn.should_log(404, false));
-        assert!(LogLevel::Info.should_log(200, false));
-        assert!(LogLevel::Debug.should_log(200, false));
+    fn root_proxy_uses_global_logging_level() {
+        let sites = vec![SiteRuntime {
+            domains: Vec::new(),
+            target: UpstreamRuntime::Direct(UpstreamConfig {
+                address: "127.0.0.1:3000".into(),
+                tls: false,
+                sni: String::new(),
+                host: None,
+                ca_path: None,
+                base_path: String::new(),
+                http_version: HttpVersion::Auto,
+            }),
+            internal_routes: Vec::new(),
+            redirects: Vec::new(),
+            access: Default::default(),
+            cache: Default::default(),
+            cache_storage: Box::leak(Box::new(pingora::cache::MemCache::new())),
+            forwarding: Default::default(),
+            logging: LogLevel::Off,
+        }];
+        let ctx = RequestContext {
+            site: Some(0),
+            proxied: true,
+            upstream: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::log_level_for(&ctx, &sites, LogLevel::Info, Some(0)),
+            LogLevel::Info
+        );
+    }
+
+    #[test]
+    fn proxied_requests_are_required_for_access_log() {
+        let ctx = RequestContext {
+            proxied: false,
+            site: Some(0),
+            upstream: Some(0),
+            ..Default::default()
+        };
+        assert!(!ctx.proxied);
+        let mut ctx = ctx;
+        ctx.mark_proxied();
+        assert!(ctx.proxied);
+    }
+
+    #[test]
+    fn access_logging_disabled_when_off() {
+        assert!(!super::access_logging_enabled(LogLevel::Off));
+        assert!(super::access_logging_enabled(LogLevel::Info));
+    }
+
+    #[test]
+    fn log_levels_log_every_request_when_enabled() {
+        assert!(!LogLevel::Off.is_enabled());
+        assert!(LogLevel::Error.is_enabled());
+        assert!(LogLevel::Warn.is_enabled());
+        assert!(LogLevel::Info.is_enabled());
+        assert!(LogLevel::Debug.is_enabled());
+    }
+
+    #[test]
+    fn upstream_http_version_uses_selected_upstream() {
+        let upstream = UpstreamConfig {
+            address: "127.0.0.1:443".into(),
+            tls: true,
+            sni: "backend.example.com".into(),
+            host: None,
+            ca_path: None,
+            base_path: String::new(),
+            http_version: HttpVersion::Http3,
+        };
+        let sites = vec![SiteRuntime {
+            domains: vec!["example.com".into()],
+            target: UpstreamRuntime::Direct(upstream),
+            internal_routes: Vec::new(),
+            redirects: Vec::new(),
+            access: Default::default(),
+            cache: Default::default(),
+            cache_storage: Box::leak(Box::new(pingora::cache::MemCache::new())),
+            forwarding: Default::default(),
+            logging: LogLevel::Info,
+        }];
+        let ctx = RequestContext {
+            site: Some(0),
+            upstream: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(super::upstream_http_version(&ctx, &sites), "3");
+    }
+
+    #[test]
+    fn http_version_labels_are_stable() {
+        assert_eq!(HttpVersion::Auto.log_label(), "auto");
+        assert_eq!(HttpVersion::Http11.log_label(), "1.1");
+        assert_eq!(HttpVersion::Http2.log_label(), "2");
+        assert_eq!(HttpVersion::Http3.log_label(), "3");
     }
 }

@@ -56,5 +56,6 @@ pub struct RequestContext {
     pub internal_route: Option<usize>,
     pub path_rewrite: Option<PathRewriteState>,
     pub skip_access_log: bool,
+    pub proxied: bool,
     pub started_at: Option<std::time::Instant>,
 }

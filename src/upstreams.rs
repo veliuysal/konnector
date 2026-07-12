@@ -35,27 +35,30 @@ pub async fn select_peer(
     path: &str,
     ctx: &mut RequestContext,
 ) -> Result<Box<HttpPeer>> {
+    let upstream = resolve_upstream_selection(site, path, ctx)?;
+    let peer = HttpPeer::new(
+        upstream.address.as_str(),
+        upstream.tls,
+        upstream.sni.clone(),
+    );
+    configure_peer(peer, upstream)
+}
+
+pub fn resolve_upstream_selection<'a>(
+    site: &'a SiteRuntime,
+    path: &str,
+    ctx: &mut RequestContext,
+) -> Result<&'a UpstreamConfig> {
     if let Some(route_index) = internal_routes::find(path, &site.internal_routes) {
         ctx.internal_route = Some(route_index);
         ctx.upstream = Some(0);
-        let upstream = &site.internal_routes[route_index].upstream;
-        let peer = HttpPeer::new(
-            upstream.address.as_str(),
-            upstream.tls,
-            upstream.sni.clone(),
-        );
-        return configure_peer(peer, upstream);
+        return Ok(&site.internal_routes[route_index].upstream);
     }
 
     match &site.target {
         UpstreamRuntime::Direct(upstream) => {
             ctx.upstream = Some(0);
-            let peer = HttpPeer::new(
-                upstream.address.as_str(),
-                upstream.tls,
-                upstream.sni.to_string(),
-            );
-            configure_peer(peer, upstream)
+            Ok(upstream)
         }
         UpstreamRuntime::LoadBalanced {
             upstreams,
@@ -75,15 +78,14 @@ pub async fn select_peer(
                     )
                 })?;
             ctx.upstream = Some(upstream_index);
-            let upstream = &upstreams[upstream_index];
-            let peer = HttpPeer::new(backend, upstream.tls, upstream.sni.to_string());
-            configure_peer(peer, upstream)
+            Ok(&upstreams[upstream_index])
         }
     }
 }
 
 fn configure_peer(mut peer: HttpPeer, upstream: &UpstreamConfig) -> Result<Box<HttpPeer>> {
     peer.options.idle_timeout = Some(UPSTREAM_IDLE_TIMEOUT);
+    peer.options.alpn = upstream.http_version.to_alpn(upstream.tls);
     if let Some(path) = &upstream.ca_path {
         let ca = ROOT_CA.get_or_try_init(|| load_ca(path))?;
         peer.options.ca = Some(Arc::clone(ca));

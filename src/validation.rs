@@ -1,5 +1,6 @@
 use crate::configs::{
-    AccessPolicy, ProxyTarget, RedirectMatch, ServerConfig, SiteConfig, UpstreamConfig,
+    AccessPolicy, HttpVersion, ProxyTarget, RedirectMatch, ServerConfig, SiteConfig,
+    TcpProxyConfig, UpstreamConfig,
 };
 use crate::ssl;
 use std::{collections::HashSet, path::Path};
@@ -8,6 +9,10 @@ pub fn filter_valid_sites(sites: Vec<SiteConfig>) -> Vec<SiteConfig> {
     let mut domains = HashSet::new();
     let mut valid = Vec::new();
     for site in sites {
+        if !site.enabled {
+            log::info!("site {} is disabled", site.primary_domain());
+            continue;
+        }
         let mut trial = domains.clone();
         match validate_site(&site, &mut trial) {
             Ok(()) => {
@@ -18,6 +23,41 @@ pub fn filter_valid_sites(sites: Vec<SiteConfig>) -> Vec<SiteConfig> {
         }
     }
     valid
+}
+
+pub fn filter_valid_tcp(proxies: Vec<TcpProxyConfig>) -> Vec<TcpProxyConfig> {
+    let mut listens = HashSet::<u16>::new();
+    let mut valid = Vec::new();
+    for proxy in proxies {
+        if !proxy.enabled {
+            log::info!("tcp {} is disabled", proxy.name);
+            continue;
+        }
+        match validate_tcp(&proxy, &mut listens) {
+            Ok(()) => valid.push(proxy),
+            Err(error) => log::error!("skipping tcp {}: {error}", proxy.name),
+        }
+    }
+    valid
+}
+
+fn validate_tcp(proxy: &TcpProxyConfig, listens: &mut HashSet<u16>) -> Result<(), String> {
+    let label = if proxy.name.is_empty() {
+        "tcp proxy"
+    } else {
+        proxy.name.as_str()
+    };
+    if proxy.listen.trim().is_empty() {
+        return Err(format!("{label} listen address must not be empty"));
+    }
+    let port = proxy
+        .listen_port()
+        .map_err(|error| format!("{label}: {error}"))?;
+    if !listens.insert(port) {
+        return Err(format!("duplicate tcp listen port: {port}"));
+    }
+    proxy.upstream.address().map_err(|error| format!("{label}: {error}"))?;
+    Ok(())
 }
 
 pub fn validate_server(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), String> {
@@ -53,6 +93,7 @@ pub fn validate_server(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), 
         if root_proxy.tls && root_proxy.sni.trim().is_empty() {
             return Err("root TLS proxy requires SNI".into());
         }
+        validate_upstream_http_version("root proxy", root_proxy)?;
         validate_ca(root_proxy)?;
     }
     Ok(())
@@ -169,7 +210,23 @@ fn validate_upstream(site: &SiteConfig, upstream: &UpstreamConfig) -> Result<(),
     if upstream.tls && upstream.sni.trim().is_empty() {
         return Err(format!("{label} has a TLS upstream without SNI"));
     }
+    validate_upstream_http_version(label, upstream)?;
     validate_ca(upstream)?;
+    Ok(())
+}
+
+fn validate_upstream_http_version(label: &str, upstream: &UpstreamConfig) -> Result<(), String> {
+    if upstream.http_version == HttpVersion::Http3 && !upstream.tls {
+        return Err(format!("{label} requires TLS for HTTP/3 upstream connections"));
+    }
+    if upstream.http_version == HttpVersion::Http3 && upstream.sni.trim().is_empty() {
+        return Err(format!("{label} requires SNI for HTTP/3 upstream connections"));
+    }
+    if upstream.http_version == HttpVersion::Http2 && !upstream.tls {
+        return Err(format!(
+            "{label} requires TLS for HTTP/2 upstream connections"
+        ));
+    }
     Ok(())
 }
 
@@ -190,10 +247,55 @@ fn validate_ca(upstream: &UpstreamConfig) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::configs;
+    use std::collections::HashSet;
 
     #[test]
     fn rust_configuration_is_valid() {
         let sites = configs::load_sites().unwrap();
         validate(&configs::server(), &sites).unwrap();
+    }
+
+    #[test]
+    fn disabled_site_is_skipped() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "enabled: false\ndomains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n",
+        )
+        .unwrap();
+        assert!(!site.enabled);
+        let valid = crate::validation::filter_valid_sites(vec![site]);
+        assert!(valid.is_empty());
+    }
+
+    #[test]
+    fn disabled_tcp_proxy_is_skipped() {
+        let proxy: TcpProxyConfig = serde_yaml::from_str(
+            "enabled: false\nname: postgres\nlisten: 5432\nupstream:\n  instance: localhost\n",
+        )
+        .unwrap();
+        assert!(!proxy.enabled);
+        let valid = crate::validation::filter_valid_tcp(vec![proxy]);
+        assert!(valid.is_empty());
+    }
+
+    #[test]
+    fn http2_upstream_requires_tls() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n    version: \"2\"\n",
+        )
+        .unwrap();
+        let mut domains = HashSet::new();
+        let error = validate_site(&site, &mut domains).unwrap_err();
+        assert!(error.contains("HTTP/2"));
+    }
+
+    #[test]
+    fn http3_upstream_requires_tls_and_sni() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n    version: \"3\"\n",
+        )
+        .unwrap();
+        let mut domains = HashSet::new();
+        let error = validate_site(&site, &mut domains).unwrap_err();
+        assert!(error.contains("HTTP/3"));
     }
 }

@@ -2,7 +2,7 @@ use crate::{
     config_watcher,
     configs,
     proxy::{build_proxy_routing, shared, DomainProxy},
-    ssl, ssl_watcher, validation,
+    ssl, ssl_watcher, tcp_proxy::TcpProxyManager, validation,
 };
 use pingora::prelude::*;
 use std::sync::Arc;
@@ -15,6 +15,11 @@ pub fn run() {
         log::warn!("no valid site configs loaded; working page will be used for unmatched hosts");
     }
     let root = configs::server();
+    if root.root_proxy.is_some() && !root.logging.is_enabled() {
+        log::warn!(
+            "root proxy is enabled but logging.level is off; localhost and unmatched host requests will not be logged"
+        );
+    }
     if let Err(error) = validation::validate_server(&root, &sites) {
         log::error!("server configuration issue: {error}");
     }
@@ -38,7 +43,9 @@ pub fn run() {
         root.logging,
         Some(&mut server),
     ));
-    config_watcher::start(routing.clone());
+    let tcp_manager = TcpProxyManager::new();
+    tcp_manager.apply(validation::filter_valid_tcp(configs::load_tcp_lenient()), root.logging);
+    config_watcher::start(routing.clone(), tcp_manager.clone());
     ssl_watcher::start(root.clone(), sites);
 
     let mut service = http_proxy_service(&server.configuration, DomainProxy::new(routing));

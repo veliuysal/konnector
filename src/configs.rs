@@ -38,6 +38,8 @@ pub enum TlsProviderKind {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SiteConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub domains: Vec<String>,
     #[serde(rename = "proxy")]
     pub target: ProxyTarget,
@@ -53,6 +55,8 @@ pub struct SiteConfig {
     pub forwarding: ForwardingConfig,
     #[serde(default)]
     pub logging: Option<LoggingConfig>,
+    #[serde(default)]
+    pub http: HttpSettings,
 }
 
 impl SiteConfig {
@@ -69,6 +73,63 @@ impl SiteConfig {
             .map(|logging| logging.level)
             .unwrap_or(default)
     }
+
+    pub fn resolve_http_versions(&mut self) {
+        let default = self.http.version;
+        match &mut self.target {
+            ProxyTarget::Direct { upstream } => upstream.apply_http_default(default),
+            ProxyTarget::LoadBalanced { upstreams, .. } => {
+                for upstream in upstreams {
+                    upstream.apply_http_default(default);
+                }
+            }
+        }
+        for route in &mut self.internal_routes {
+            route.upstream.apply_http_default(default);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpVersion {
+    #[default]
+    Auto,
+    #[serde(rename = "1.1", alias = "1")]
+    Http11,
+    #[serde(rename = "2")]
+    Http2,
+    #[serde(rename = "3")]
+    Http3,
+}
+
+impl HttpVersion {
+    pub fn log_label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Http11 => "1.1",
+            Self::Http2 => "2",
+            Self::Http3 => "3",
+        }
+    }
+
+    pub fn to_alpn(self, tls: bool) -> pingora::protocols::ALPN {
+        use pingora::protocols::ALPN;
+        match self {
+            Self::Http11 => ALPN::H1,
+            Self::Http2 if tls => ALPN::H2,
+            Self::Http2 => ALPN::H1,
+            Self::Http3 => ALPN::Custom(pingora::protocols::tls::CustomALPN::new(b"h3".to_vec())),
+            Self::Auto if tls => ALPN::H2H1,
+            Self::Auto => ALPN::H1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpSettings {
+    pub version: HttpVersion,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,13 +144,8 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    pub fn should_log(self, status: u16, has_error: bool) -> bool {
-        match self {
-            Self::Off => false,
-            Self::Error => has_error || status >= 500,
-            Self::Warn => has_error || status >= 400,
-            Self::Info | Self::Debug => true,
-        }
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
     }
 
     pub fn is_debug(self) -> bool {
@@ -149,6 +205,15 @@ pub struct UpstreamConfig {
     pub host: Option<String>,
     pub ca_path: Option<String>,
     pub base_path: String,
+    pub http_version: HttpVersion,
+}
+
+impl UpstreamConfig {
+    pub(crate) fn apply_http_default(&mut self, default: HttpVersion) {
+        if self.http_version == HttpVersion::Auto {
+            self.http_version = default;
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -161,6 +226,8 @@ struct RawUpstreamConfig {
     sni: Option<String>,
     host: Option<String>,
     ca_path: Option<String>,
+    #[serde(default, rename = "version")]
+    http_version: Option<HttpVersion>,
 }
 
 impl<'de> Deserialize<'de> for UpstreamConfig {
@@ -307,7 +374,10 @@ pub(crate) fn load_sites_from_lenient(directory: &Path) -> Vec<SiteConfig> {
     let mut sites = Vec::new();
     for path in paths {
         match load_site_file(&path) {
-            Ok(site) => sites.push(site),
+            Ok(mut site) => {
+                site.resolve_http_versions();
+                sites.push(site);
+            }
             Err(error) => log::error!("{error}"),
         }
     }
@@ -372,6 +442,9 @@ fn tls_provider_from_env() -> TlsProviderConfig {
 }
 
 fn is_site_config(path: &Path) -> bool {
+    if is_tcp_config(path) {
+        return false;
+    }
     if !matches!(
         path.extension().and_then(|value| value.to_str()),
         Some("yml" | "yaml")
@@ -384,6 +457,184 @@ fn is_site_config(path: &Path) -> bool {
     )
 }
 
+pub(crate) fn is_tcp_config(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.ends_with(".tcp.yaml") || name.ends_with(".tcp.yml"))
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpProxyConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub name: String,
+    pub listen: String,
+    pub upstream: TcpUpstreamConfig,
+}
+
+impl TcpProxyConfig {
+    pub fn listen_address(&self) -> Result<String, String> {
+        normalize_listen_address(&self.listen)
+    }
+
+    pub fn listen_port(&self) -> Result<u16, String> {
+        let address = self.listen_address()?;
+        address
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse().ok())
+            .ok_or_else(|| format!("invalid tcp listen port in {}", self.listen))
+    }
+
+    pub fn listen_addresses(&self) -> Result<Vec<String>, String> {
+        let primary = self.listen_address()?;
+        let mut addresses = vec![primary.clone()];
+        if primary.starts_with("0.0.0.0:") {
+            if let Some(port) = primary.rsplit_once(':').map(|(_, port)| port) {
+                addresses.push(format!("[::]:{port}"));
+            }
+        }
+        Ok(addresses)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpUpstreamConfig {
+    instance: Option<String>,
+    address: Option<String>,
+}
+
+impl TcpUpstreamConfig {
+    pub fn address(&self) -> Result<String, String> {
+        let value = self
+            .instance
+            .as_deref()
+            .or(self.address.as_deref())
+            .ok_or_else(|| "tcp upstream requires instance or address".to_string())?
+            .trim();
+        if value.is_empty() {
+            return Err("tcp upstream cannot be empty".into());
+        }
+        normalize_tcp_address(value)
+    }
+}
+
+pub fn load_tcp_lenient() -> Vec<TcpProxyConfig> {
+    load_tcp_from_lenient(&config_dir())
+}
+
+pub(crate) fn load_tcp_from_lenient(directory: &Path) -> Vec<TcpProxyConfig> {
+    let paths = match list_tcp_config_paths(directory) {
+        Ok(paths) => paths,
+        Err(error) => {
+            log::error!("{error}");
+            return Vec::new();
+        }
+    };
+    let mut proxies = Vec::new();
+    for path in paths {
+        match load_tcp_file(&path) {
+            Ok(mut proxy) => {
+                if proxy.name.is_empty() {
+                    proxy.name = path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("tcp")
+                        .trim_end_matches(".tcp")
+                        .to_owned();
+                }
+                proxies.push(proxy);
+            }
+            Err(error) => log::error!("{error}"),
+        }
+    }
+    proxies
+}
+
+fn list_tcp_config_paths(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = fs::read_dir(directory)
+        .map_err(|error| {
+            format!(
+                "cannot read config directory {}: {error}",
+                directory.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| is_tcp_config(path))
+        .collect::<Vec<PathBuf>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn load_tcp_file(path: &Path) -> Result<TcpProxyConfig, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    serde_yaml::from_str(&raw)
+        .map_err(|error| format!("invalid YAML in {}: {error}", path.display()))
+}
+
+fn normalize_listen_address(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("tcp listen cannot be empty".into());
+    }
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(format!("0.0.0.0:{value}"));
+    }
+    if let Some(port) = value.strip_prefix(':') {
+        if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Ok(format!("0.0.0.0:{port}"));
+        }
+    }
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if host.parse::<std::net::IpAddr>().is_ok()
+            || host == "0.0.0.0"
+            || host == "localhost"
+            || host.starts_with('[')
+        {
+            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Ok(value.to_owned());
+            }
+        } else {
+            return Err(format!(
+                "tcp listen must be an IP address or port, not a domain ({value})"
+            ));
+        }
+    }
+    Err(format!("invalid tcp listen address: {value}"))
+}
+
+fn normalize_tcp_address(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("tcp upstream cannot be empty".into());
+    }
+    const DEFAULT_PORT: u16 = 5432;
+    if value.starts_with('[') {
+        return Ok(if value.contains("]:") {
+            value.to_owned()
+        } else if value.ends_with(']') {
+            format!("{value}:{DEFAULT_PORT}")
+        } else {
+            return Err("invalid bracketed IPv6 tcp upstream".into());
+        });
+    }
+    let colon_count = value.bytes().filter(|byte| *byte == b':').count();
+    if colon_count > 1 {
+        return Ok(format!("[{value}]:{DEFAULT_PORT}"));
+    }
+    if colon_count == 1
+        && value.rsplit_once(':').is_some_and(|(_, port)| {
+            !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Ok(value.to_owned());
+    }
+    Ok(format!("{value}:{DEFAULT_PORT}"))
+}
+
 #[derive(Deserialize)]
 struct RootConfig {
     #[serde(default)]
@@ -392,6 +643,8 @@ struct RootConfig {
     upstream: Option<UpstreamConfig>,
     #[serde(default)]
     logging: LoggingConfig,
+    #[serde(default)]
+    http: HttpSettings,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -399,6 +652,7 @@ struct RootSettings {
     enabled: bool,
     upstream: Option<UpstreamConfig>,
     logging: LogLevel,
+    http_version: HttpVersion,
 }
 
 impl From<RootConfig> for RootSettings {
@@ -407,6 +661,7 @@ impl From<RootConfig> for RootSettings {
             enabled: config.enabled,
             upstream: config.upstream,
             logging: config.logging.level,
+            http_version: config.http.version,
         }
     }
 }
@@ -446,7 +701,10 @@ fn root_proxy_from_settings(path: Option<&Path>, settings: &RootSettings) -> Opt
         return None;
     }
     match settings.upstream.clone() {
-        Some(upstream) => Some(upstream),
+        Some(mut upstream) => {
+            upstream.apply_http_default(settings.http_version);
+            Some(upstream)
+        }
         None => {
             if let Some(path) = path {
                 log::warn!(
@@ -471,6 +729,7 @@ fn root_proxy_from_env() -> Option<UpstreamConfig> {
         host: env::var("ROOT_PROXY_HOST").ok(),
         ca_path: env::var("ROOT_PROXY_CA_PATH").ok(),
         base_path: String::new(),
+        http_version: HttpVersion::Auto,
     })
 }
 
@@ -492,6 +751,7 @@ fn normalize_upstream(raw: RawUpstreamConfig) -> Result<UpstreamConfig, String> 
             host: raw.host,
             ca_path: raw.ca_path,
             base_path: String::new(),
+            http_version: raw.http_version.unwrap_or_default(),
         }),
         (None, Some(value)) => {
             if raw.tls.is_some() || raw.sni.is_some() {
@@ -532,6 +792,7 @@ fn normalize_upstream(raw: RawUpstreamConfig) -> Result<UpstreamConfig, String> 
                 host: host_header,
                 ca_path: raw.ca_path,
                 base_path: path.to_owned(),
+                http_version: raw.http_version.unwrap_or_default(),
             })
         }
         (Some(_), Some(_)) => Err("set either upstream address or url, not both".into()),
@@ -597,6 +858,15 @@ fn default_redirect_status() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn site_enabled_defaults_to_true() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n",
+        )
+        .unwrap();
+        assert!(site.enabled);
+    }
 
     #[test]
     fn example_configs_load() {
@@ -700,5 +970,89 @@ mod tests {
         assert_eq!(localhost.address, "localhost:80");
         assert_eq!(ip.address, "10.0.0.5:9000");
         assert_eq!(ipv6.address, "[::1]:80");
+    }
+
+    #[test]
+    fn tcp_configs_are_excluded_from_sites() {
+        let directory = Path::new("configs");
+        assert!(directory.join("postgres.tcp.yaml").is_file());
+        let sites = load_sites_from(directory).unwrap();
+        assert_eq!(sites.len(), 1);
+    }
+
+    #[test]
+    fn tcp_config_parses_and_normalizes_upstream() {
+        let proxy: TcpProxyConfig = serde_yaml::from_str(
+            "name: postgres\nlisten: 5432\nupstream:\n  instance: localhost\n",
+        )
+        .unwrap();
+        assert_eq!(proxy.name, "postgres");
+        assert_eq!(proxy.listen_address().unwrap(), "0.0.0.0:5432");
+        assert_eq!(
+            proxy.listen_addresses().unwrap(),
+            vec!["0.0.0.0:5432".to_owned(), "[::]:5432".to_owned()]
+        );
+        assert_eq!(proxy.upstream.address().unwrap(), "localhost:5432");
+    }
+
+    #[test]
+    fn tcp_upstream_accepts_domain_name() {
+        let proxy: TcpProxyConfig = serde_yaml::from_str(
+            "listen: 5432\nupstream:\n  instance: postgres.internal\n",
+        )
+        .unwrap();
+        assert_eq!(proxy.upstream.address().unwrap(), "postgres.internal:5432");
+    }
+
+    #[test]
+    fn http_version_parses_from_yaml() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n    version: \"1.1\"\nhttp:\n  version: \"2\"\n",
+        )
+        .unwrap();
+        assert_eq!(site.http.version, HttpVersion::Http2);
+        if let ProxyTarget::Direct { upstream } = &site.target {
+            assert_eq!(upstream.http_version, HttpVersion::Http11);
+        } else {
+            panic!("expected direct proxy target");
+        }
+    }
+
+    #[test]
+    fn site_http_version_defaults_upstream_auto() {
+        let mut site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\nhttp:\n  version: \"1.1\"\n",
+        )
+        .unwrap();
+        site.resolve_http_versions();
+        if let ProxyTarget::Direct { upstream } = site.target {
+            assert_eq!(upstream.http_version, HttpVersion::Http11);
+        } else {
+            panic!("expected direct proxy target");
+        }
+    }
+
+    #[test]
+    fn http3_version_parses_from_yaml() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n    version: \"3\"\n",
+        )
+        .unwrap();
+        if let ProxyTarget::Direct { upstream } = &site.target {
+            assert_eq!(upstream.http_version, HttpVersion::Http3);
+        } else {
+            panic!("expected direct proxy target");
+        }
+    }
+
+    #[test]
+    fn root_http_version_applies_to_upstream() {
+        let root: RootConfig = serde_yaml::from_str(
+            "enabled: true\nhttp:\n  version: \"1.1\"\nupstream:\n  instance: localhost\n",
+        )
+        .unwrap();
+        let settings: RootSettings = root.into();
+        let upstream = root_proxy_from_settings(None, &settings).unwrap();
+        assert_eq!(upstream.http_version, HttpVersion::Http11);
     }
 }

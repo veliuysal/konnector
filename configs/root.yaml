@@ -1,14 +1,18 @@
 # Fallback for requests that do not match any site domain.
+# Set enabled: false to show the "Server is working" page for unmatched hosts.
 # When this file is missing or empty, root proxy defaults to disabled.
-# When disabled, visitors see the "Server is working" page.
-enabled: false
+enabled: true
 
 # Global default for request logging (off, error, warn, info, debug).
-# Site configs can override with their own logging.level.
+# Required for localhost / root proxy logs. Any level except off logs proxied requests at INFO.
+# Site configs can override HTTP logging with their own logging.level.
 logging:
-  level: off
+  level: info
 
-# Enable and set your upstream when you want IP/unmatched hosts proxied:
-# enabled: true
-# upstream:
-#   instance: 127.0.0.1:3000
+# Default upstream HTTP protocol version for the root proxy (1.1, 2, 3, auto).
+http:
+  version: auto
+
+upstream:
+  instance: 127.0.0.1:3000
+  version: auto

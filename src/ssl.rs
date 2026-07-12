@@ -360,6 +360,7 @@ mod tests {
                         host: None,
                         ca_path: None,
                         base_path: String::new(),
+                        http_version: crate::configs::HttpVersion::Auto,
                     },
                 },
                 internal_routes: Vec::new(),
@@ -368,6 +369,8 @@ mod tests {
                 cache: crate::configs::CacheConfig::default(),
                 forwarding: crate::configs::ForwardingConfig::Cloudflare,
                 logging: None,
+                http: crate::configs::HttpSettings::default(),
+                enabled: true,
             },
         ];
         assert_eq!(proxied_tls_domains(&sites), vec!["example.com".to_owned()]);

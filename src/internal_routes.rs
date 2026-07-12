@@ -11,7 +11,7 @@ pub fn find(path: &str, routes: &[InternalRouteConfig]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configs::UpstreamConfig;
+    use crate::configs::{HttpVersion, UpstreamConfig};
 
     #[test]
     fn finds_only_the_internal_prefix() {
@@ -24,6 +24,7 @@ mod tests {
                 host: None,
                 ca_path: None,
                 base_path: String::new(),
+                http_version: HttpVersion::Auto,
             },
             strip_prefix: true,
         }];

@@ -1,0 +1,10 @@
+# PostgreSQL TCP proxy example.
+# Clients connect with domain or server IP — no domain config needed.
+# Konnector listens on IPv4 and IPv6 so DNS (A or AAAA) always reaches the port.
+# File name must end with .tcp.yaml or .tcp.yml
+enabled: false
+
+name: postgres
+listen: 5432
+upstream:
+  instance: 127.0.0.1:5432

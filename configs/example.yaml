@@ -1,3 +1,6 @@
+enabled: true
+
+# Set enabled: false to keep this file but stop serving the site.
 domains:
   - example.com
   - www.example.com
@@ -23,7 +26,12 @@ cache:
 
 forwarding: direct
 
+# Upstream HTTP protocol version (1.1, 2, 3, auto). HTTP/2 and HTTP/3 require TLS.
+http:
+  version: auto
+
 # Request logging for this site (off, error, warn, info, debug).
-# Omit to inherit the default from root.yaml.
+# Any level except off logs proxied HTTP requests at INFO. Use debug for upstream and timing details.
+# TCP logging uses the root.yaml default. Omit to inherit the root default.
 logging:
   level: info

@@ -9,6 +9,7 @@ mod domain_routing;
 mod error_pages;
 mod forwarding;
 mod health_check;
+mod http3;
 mod internal_routes;
 mod path_rewrite;
 mod proxy;
@@ -16,6 +17,7 @@ mod redirects;
 mod request_logging;
 mod ssl;
 mod ssl_watcher;
+mod tcp_proxy;
 mod upstreams;
 mod validation;
 

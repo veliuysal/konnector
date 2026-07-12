@@ -1,7 +1,7 @@
 use super::{routing::snapshot, routing::SharedRouting, RequestContext};
 use crate::{
     access_control, cache_policy, default_site, domain_routing, error_pages,
-    forwarding, health_check, path_rewrite, redirects, request_logging, upstreams,
+    forwarding, health_check, http3, path_rewrite, redirects, request_logging, upstreams,
 };
 use async_trait::async_trait;
 use pingora::{cache::CacheKey, prelude::*, proxy::FailToProxy};
@@ -38,18 +38,31 @@ impl ProxyHttp for DomainProxy {
             return Ok(true);
         }
         let routing = snapshot(&self.routing);
-        let Some(site_index) = domain_routing::site_for(session, &routing.sites) else {
-            if let Some(root_site) = routing.root_site {
-                ctx.site = Some(root_site);
-                return Ok(false);
+        let site_index = match domain_routing::site_for(session, &routing.sites) {
+            Some(index) => index,
+            None => {
+                if let Some(root_site) = routing.root_site {
+                    root_site
+                } else {
+                    return default_site::respond(session).await;
+                }
             }
-            return default_site::respond(session).await;
         };
         ctx.site = Some(site_index);
         if redirects::apply(session, &routing.sites[site_index]).await? {
             return Ok(true);
         }
-        access_control::reject_disallowed(session, ctx, &routing.sites).await
+        if access_control::reject_disallowed(session, ctx, &routing.sites).await? {
+            return Ok(true);
+        }
+        http3::proxy_if_needed(
+            session,
+            ctx,
+            &routing.sites,
+            routing.default_logging,
+            routing.root_site,
+        )
+        .await
     }
 
     async fn upstream_peer(
@@ -57,6 +70,7 @@ impl ProxyHttp for DomainProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        ctx.mark_proxied();
         let routing = snapshot(&self.routing);
         let site_index = ctx
             .site
@@ -64,12 +78,20 @@ impl ProxyHttp for DomainProxy {
             .or(routing.root_site)
             .ok_or_else(|| Error::explain(ErrorType::InternalError, "root proxy is disabled"))?;
         ctx.site = Some(site_index);
-        upstreams::select_peer(
+        let peer = upstreams::select_peer(
             &routing.sites[site_index],
             session.req_header().uri.path(),
             ctx,
         )
-        .await
+        .await?;
+        request_logging::log_proxy_started(
+            session,
+            ctx,
+            &routing.sites,
+            routing.default_logging,
+            routing.root_site,
+        );
+        Ok(peer)
     }
 
     async fn upstream_request_filter(
@@ -121,6 +143,7 @@ impl ProxyHttp for DomainProxy {
             ctx,
             &routing.sites,
             routing.default_logging,
+            routing.root_site,
             error,
         );
     }
@@ -129,16 +152,8 @@ impl ProxyHttp for DomainProxy {
         &self,
         session: &mut Session,
         error: &Error,
-        ctx: &mut Self::CTX,
+        _ctx: &mut Self::CTX,
     ) -> FailToProxy {
-        let routing = snapshot(&self.routing);
-        request_logging::log_proxy_failure(
-            session,
-            ctx,
-            &routing.sites,
-            routing.default_logging,
-            error,
-        );
         error_pages::respond_to_proxy_failure(session, error).await
     }
 }
