@@ -617,10 +617,21 @@ mod tests {
 
     #[test]
     fn root_config_is_disabled_by_default() {
-        let (path, settings) = load_root_settings(Path::new("configs"));
+        let temp = std::env::temp_dir().join(format!("konnector-root-default-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(
+            temp.join("root.yaml"),
+            "enabled: false\nlogging:\n  level: off\n",
+        )
+        .unwrap();
+
+        let (path, settings) = load_root_settings(&temp);
         assert!(path.is_some());
         assert!(!settings.enabled);
         assert!(root_proxy_from_settings(path.as_deref(), &settings).is_none());
+
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]
