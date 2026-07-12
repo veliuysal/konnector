@@ -11,6 +11,7 @@ pub struct ServerConfig {
     pub threads: usize,
     pub https: Option<HttpsConfig>,
     pub root_proxy: Option<UpstreamConfig>,
+    pub logging: LogLevel,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +51,8 @@ pub struct SiteConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub forwarding: ForwardingConfig,
+    #[serde(default)]
+    pub logging: Option<LoggingConfig>,
 }
 
 impl SiteConfig {
@@ -59,6 +62,45 @@ impl SiteConfig {
             .map(String::as_str)
             .unwrap_or("<no-domain>")
     }
+
+    pub fn resolved_logging(&self, default: LogLevel) -> LogLevel {
+        self.logging
+            .as_ref()
+            .map(|logging| logging.level)
+            .unwrap_or(default)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    #[default]
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+impl LogLevel {
+    pub fn should_log(self, status: u16, has_error: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Error => has_error || status >= 500,
+            Self::Warn => has_error || status >= 400,
+            Self::Info | Self::Debug => true,
+        }
+    }
+
+    pub fn is_debug(self) -> bool {
+        matches!(self, Self::Debug)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    pub level: LogLevel,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -189,6 +231,8 @@ fn default_threads() -> usize {
 }
 
 pub fn server() -> ServerConfig {
+    let directory = config_dir();
+    let (path, root) = load_root_settings(&directory);
     ServerConfig {
         http_listen: env::var("HTTP_LISTEN").unwrap_or_else(|_| "0.0.0.0:80".to_owned()),
         https_listen: env::var("HTTPS_LISTEN").unwrap_or_else(|_| "0.0.0.0:443".to_owned()),
@@ -197,7 +241,9 @@ pub fn server() -> ServerConfig {
             .map(|value| value.parse().expect("THREADS must be a number"))
             .unwrap_or_else(default_threads),
         https: https_from_env(),
-        root_proxy: root_proxy_from_env().or_else(|| root_proxy_from_file(&config_dir())),
+        root_proxy: root_proxy_from_env()
+            .or_else(|| root_proxy_from_settings(path.as_deref(), &root)),
+        logging: root.logging,
     }
 }
 
@@ -205,8 +251,31 @@ pub fn tls_provider() -> TlsProviderConfig {
     tls_provider_from_env()
 }
 
+#[cfg(test)]
 pub fn load_sites() -> Result<Vec<SiteConfig>, String> {
     load_sites_from(&config_dir())
+}
+
+pub fn load_sites_lenient() -> Vec<SiteConfig> {
+    load_sites_from_lenient(&config_dir())
+}
+
+pub(crate) fn warn_root_file(directory: &Path) {
+    if let Err(error) = validate_root_file(directory) {
+        log::warn!("{error}");
+    }
+}
+
+pub(crate) fn validate_root_file(directory: &Path) -> Result<(), String> {
+    let (path, settings) = load_root_settings(directory);
+    if settings.enabled && settings.upstream.is_none() {
+        let label = path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "root.yaml".to_owned());
+        return Err(format!("{label} has enabled: true but no upstream"));
+    }
+    Ok(())
 }
 
 pub fn config_dir() -> PathBuf {
@@ -223,7 +292,38 @@ pub fn config_dir() -> PathBuf {
     PathBuf::from("configs")
 }
 
+pub(crate) fn load_sites_from_lenient(directory: &Path) -> Vec<SiteConfig> {
+    let paths = match list_site_config_paths(directory) {
+        Ok(paths) => paths,
+        Err(error) => {
+            log::error!("{error}");
+            return Vec::new();
+        }
+    };
+    if paths.is_empty() {
+        log::warn!("no YAML site configs found in {}", directory.display());
+        return Vec::new();
+    }
+    let mut sites = Vec::new();
+    for path in paths {
+        match load_site_file(&path) {
+            Ok(site) => sites.push(site),
+            Err(error) => log::error!("{error}"),
+        }
+    }
+    sites
+}
+
+#[cfg(test)]
 pub(crate) fn load_sites_from(directory: &Path) -> Result<Vec<SiteConfig>, String> {
+    let paths = list_site_config_paths(directory)?;
+    if paths.is_empty() {
+        return Err(format!("no YAML configs found in {}", directory.display()));
+    }
+    paths.into_iter().map(|path| load_site_file(&path)).collect()
+}
+
+fn list_site_config_paths(directory: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = fs::read_dir(directory)
         .map_err(|error| {
             format!(
@@ -235,18 +335,14 @@ pub(crate) fn load_sites_from(directory: &Path) -> Result<Vec<SiteConfig>, Strin
         .filter(|path| is_site_config(path))
         .collect::<Vec<PathBuf>>();
     paths.sort();
-    if paths.is_empty() {
-        return Err(format!("no YAML configs found in {}", directory.display()));
-    }
-    paths
-        .into_iter()
-        .map(|path| {
-            let raw = fs::read_to_string(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-            serde_yaml::from_str(&raw)
-                .map_err(|error| format!("invalid YAML in {}: {error}", path.display()))
-        })
-        .collect()
+    Ok(paths)
+}
+
+fn load_site_file(path: &Path) -> Result<SiteConfig, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    serde_yaml::from_str(&raw)
+        .map_err(|error| format!("invalid YAML in {}: {error}", path.display()))
 }
 
 fn https_from_env() -> Option<HttpsConfig> {
@@ -290,7 +386,77 @@ fn is_site_config(path: &Path) -> bool {
 
 #[derive(Deserialize)]
 struct RootConfig {
-    upstream: UpstreamConfig,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    upstream: Option<UpstreamConfig>,
+    #[serde(default)]
+    logging: LoggingConfig,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RootSettings {
+    enabled: bool,
+    upstream: Option<UpstreamConfig>,
+    logging: LogLevel,
+}
+
+impl From<RootConfig> for RootSettings {
+    fn from(config: RootConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            upstream: config.upstream,
+            logging: config.logging.level,
+        }
+    }
+}
+
+fn root_config_path(directory: &Path) -> Option<PathBuf> {
+    ["root.yaml", "root.yml"]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .find(|path| path.is_file())
+}
+
+fn load_root_settings(directory: &Path) -> (Option<PathBuf>, RootSettings) {
+    let Some(path) = root_config_path(directory) else {
+        return (None, RootSettings::default());
+    };
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            log::error!("cannot read {}: {error}", path.display());
+            return (Some(path), RootSettings::default());
+        }
+    };
+    if raw.trim().is_empty() {
+        return (Some(path), RootSettings::default());
+    }
+    match serde_yaml::from_str::<RootConfig>(&raw) {
+        Ok(config) => (Some(path), config.into()),
+        Err(error) => {
+            log::error!("invalid YAML in {}: {error}", path.display());
+            (Some(path), RootSettings::default())
+        }
+    }
+}
+
+fn root_proxy_from_settings(path: Option<&Path>, settings: &RootSettings) -> Option<UpstreamConfig> {
+    if !settings.enabled {
+        return None;
+    }
+    match settings.upstream.clone() {
+        Some(upstream) => Some(upstream),
+        None => {
+            if let Some(path) = path {
+                log::warn!(
+                    "{} has enabled: true but no upstream; using working page",
+                    path.display()
+                );
+            }
+            None
+        }
+    }
 }
 
 fn root_proxy_from_env() -> Option<UpstreamConfig> {
@@ -306,18 +472,6 @@ fn root_proxy_from_env() -> Option<UpstreamConfig> {
         ca_path: env::var("ROOT_PROXY_CA_PATH").ok(),
         base_path: String::new(),
     })
-}
-
-fn root_proxy_from_file(directory: &Path) -> Option<UpstreamConfig> {
-    let path = ["root.yaml", "root.yml"]
-        .into_iter()
-        .map(|name| directory.join(name))
-        .find(|path| path.is_file())?;
-    let raw = fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-    let config: RootConfig = serde_yaml::from_str(&raw)
-        .unwrap_or_else(|error| panic!("invalid YAML in {}: {error}", path.display()));
-    Some(config.upstream)
 }
 
 fn normalize_upstream(raw: RawUpstreamConfig) -> Result<UpstreamConfig, String> {
@@ -462,9 +616,56 @@ mod tests {
     }
 
     #[test]
-    fn root_config_loads_upstream() {
-        let upstream = root_proxy_from_file(Path::new("configs")).unwrap();
-        assert_eq!(upstream.address, "127.0.0.1:3000");
+    fn root_config_is_disabled_by_default() {
+        let (path, settings) = load_root_settings(Path::new("configs"));
+        assert!(path.is_some());
+        assert!(!settings.enabled);
+        assert!(root_proxy_from_settings(path.as_deref(), &settings).is_none());
+    }
+
+    #[test]
+    fn missing_or_empty_root_defaults_to_disabled() {
+        let temp = std::env::temp_dir().join(format!("konnector-root-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        let (path, settings) = load_root_settings(&temp);
+        assert!(path.is_none());
+        assert!(!settings.enabled);
+        assert!(settings.upstream.is_none());
+
+        fs::write(temp.join("root.yaml"), "").unwrap();
+        let (path, settings) = load_root_settings(&temp);
+        assert!(path.is_some());
+        assert!(!settings.enabled);
+
+        fs::write(temp.join("root.yaml"), "   \n").unwrap();
+        let (_, settings) = load_root_settings(&temp);
+        assert!(!settings.enabled);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn enabled_root_without_upstream_is_disabled() {
+        let upstream = serde_yaml::from_str::<RootConfig>("enabled: true\n").unwrap();
+        assert!(upstream.enabled);
+        assert!(upstream.upstream.is_none());
+    }
+
+    #[test]
+    fn logging_levels_parse_from_yaml() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\nlogging:\n  level: debug\n",
+        )
+        .unwrap();
+        assert_eq!(
+            site.resolved_logging(LogLevel::Off),
+            LogLevel::Debug
+        );
+
+        let root: RootConfig = serde_yaml::from_str("logging:\n  level: info\n").unwrap();
+        assert_eq!(root.logging.level, LogLevel::Info);
     }
 
     #[test]

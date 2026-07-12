@@ -1,0 +1,132 @@
+use super::{SiteRuntime, UpstreamRuntime};
+use crate::{
+    configs::{self, AccessPolicy, CacheConfig, ForwardingConfig, LogLevel, ProxyTarget, SiteConfig, UpstreamConfig},
+    upstreams, validation,
+};
+use pingora::{cache::MemCache, prelude::*};
+use std::sync::{Arc, RwLock};
+
+pub struct ProxyRouting {
+    pub sites: Vec<SiteRuntime>,
+    pub root_site: Option<usize>,
+    pub default_logging: LogLevel,
+}
+
+pub type SharedRouting = Arc<RwLock<Arc<ProxyRouting>>>;
+
+pub fn shared(routing: ProxyRouting) -> SharedRouting {
+    Arc::new(RwLock::new(Arc::new(routing)))
+}
+
+pub fn snapshot(routing: &SharedRouting) -> Arc<ProxyRouting> {
+    routing.read().expect("routing lock poisoned").clone()
+}
+
+pub fn build_proxy_routing(
+    site_configs: Vec<SiteConfig>,
+    root_proxy: Option<UpstreamConfig>,
+    default_logging: LogLevel,
+    mut server: Option<&mut Server>,
+) -> ProxyRouting {
+    let mut sites = Vec::with_capacity(site_configs.len());
+    for site in site_configs {
+        let primary_domain = site.primary_domain().to_owned();
+        let logging = site.resolved_logging(default_logging);
+        let target = match site.target {
+            ProxyTarget::Direct { upstream } => UpstreamRuntime::Direct(upstream),
+            ProxyTarget::LoadBalanced {
+                upstreams: pool,
+                health_check,
+                health_check_interval_seconds,
+            } => {
+                let load_balancer = upstreams::create_load_balancer(
+                    &primary_domain,
+                    &pool,
+                    health_check,
+                    health_check_interval_seconds,
+                );
+                match &mut server {
+                    Some(server) => {
+                        let background = background_service(
+                            &format!("{primary_domain} health check"),
+                            load_balancer,
+                        );
+                        let runtime = UpstreamRuntime::LoadBalanced {
+                            upstreams: pool,
+                            load_balancer: background.task(),
+                        };
+                        server.add_service(background);
+                        runtime
+                    }
+                    None => UpstreamRuntime::LoadBalanced {
+                        upstreams: pool,
+                        load_balancer: Arc::new(load_balancer),
+                    },
+                }
+            }
+        };
+        sites.push(SiteRuntime {
+            domains: site.domains,
+            target,
+            internal_routes: site.internal_routes,
+            redirects: site.redirects,
+            access: site.access,
+            cache: site.cache,
+            cache_storage: Box::leak(Box::new(MemCache::new())),
+            forwarding: site.forwarding,
+            logging,
+        });
+    }
+
+    let root_site = root_proxy.map(|root_proxy| {
+        let index = sites.len();
+        sites.push(SiteRuntime {
+            domains: Vec::new(),
+            target: UpstreamRuntime::Direct(root_proxy),
+            internal_routes: Vec::new(),
+            redirects: Vec::new(),
+            access: AccessPolicy::All,
+            cache: CacheConfig {
+                enabled: false,
+                max_file_bytes: 0,
+            },
+            cache_storage: Box::leak(Box::new(MemCache::new())),
+            forwarding: ForwardingConfig::Direct,
+            logging: default_logging,
+        });
+        index
+    });
+
+    ProxyRouting {
+        sites,
+        root_site,
+        default_logging,
+    }
+}
+
+pub fn reload_routing(routing: &SharedRouting) {
+    let directory = configs::config_dir();
+    configs::warn_root_file(&directory);
+    let sites = validation::filter_valid_sites(configs::load_sites_from_lenient(&directory));
+    let root = configs::server();
+    if let Err(error) = validation::validate_server(&root, &sites) {
+        log::error!("configuration reload skipped: {error}");
+        return;
+    }
+    let new_routing = build_proxy_routing(sites, root.root_proxy, root.logging, None);
+    let root_enabled = new_routing.root_site.is_some();
+    let named_sites = if root_enabled {
+        new_routing.sites.len().saturating_sub(1)
+    } else {
+        new_routing.sites.len()
+    };
+    {
+        let mut guard = routing.write().expect("routing lock poisoned");
+        *guard = Arc::new(new_routing);
+    }
+    if root_enabled {
+        log::info!("configuration reloaded: {named_sites} site(s), root proxy enabled");
+    } else {
+        log::info!("configuration reloaded: {named_sites} site(s), root proxy disabled");
+    }
+}

@@ -90,6 +90,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             print_usage();
             Ok(())
         }
+        "serve" => Err("serve is started by systemd; use: sudo systemctl start konnector".into()),
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -110,7 +111,7 @@ Service:
   konnector logs [--follow] [--lines N]
 
 Release:
-  konnector install [tag|package.deb|archive.tar.gz|release-url]
+  konnector install [tag|package.deb|release-url]
   konnector install --tag v0.1.0
   konnector update [tag]
   konnector upgrade [tag]
@@ -128,7 +129,10 @@ Build:
 Info:
   konnector version
 
-Run without arguments to start the proxy server.
+Server:
+  konnector serve
+
+Run `konnector serve` to start the proxy server manually.
 
 Examples:
   sudo ./konnector install
@@ -274,7 +278,23 @@ fn ensure_config_dir_env() -> Result<(), String> {
 
 fn copy_configs_to(release_dir: &Path) -> Result<(), String> {
     let destination = release_dir.join("configs");
+    let current_configs = PathBuf::from(format!("{APP_DIR}/current/configs"));
+    if current_configs.is_dir() && config_dir_has_sites(&current_configs) {
+        fs::create_dir_all(&destination)
+            .map_err(|error| format!("cannot create configs directory: {error}"))?;
+        run_command(
+            "cp",
+            &[
+                "-a",
+                &format!("{}/.", current_configs.display()),
+                &destination.display().to_string(),
+            ],
+        )?;
+        return Ok(());
+    }
     if Path::new("/usr/share/konnector/configs").is_dir() {
+        fs::create_dir_all(&destination)
+            .map_err(|error| format!("cannot create configs directory: {error}"))?;
         run_command(
             "cp",
             &[
@@ -286,6 +306,8 @@ fn copy_configs_to(release_dir: &Path) -> Result<(), String> {
         return Ok(());
     }
     if Path::new("configs").is_dir() {
+        fs::create_dir_all(&destination)
+            .map_err(|error| format!("cannot create configs directory: {error}"))?;
         run_command(
             "cp",
             &["-a", "configs/.", &destination.display().to_string()],
@@ -293,6 +315,19 @@ fn copy_configs_to(release_dir: &Path) -> Result<(), String> {
         return Ok(());
     }
     Err("configs directory not found in package or release".into())
+}
+
+fn config_dir_has_sites(directory: &Path) -> bool {
+    fs::read_dir(directory)
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                matches!(
+                    entry.path().extension().and_then(|value| value.to_str()),
+                    Some("yaml" | "yml")
+                )
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn install_service_file() -> Result<(), String> {
@@ -307,9 +342,34 @@ fn install_cli_symlink() -> Result<(), String> {
     if !runtime.is_file() {
         return Ok(());
     }
+    grant_bind_capability(&runtime)?;
     fs::remove_file("/usr/bin/konnector").ok();
     std::os::unix::fs::symlink(&runtime, "/usr/bin/konnector")
         .map_err(|error| format!("cannot link /usr/bin/konnector: {error}"))?;
+    Ok(())
+}
+
+fn grant_bind_capability(binary: &Path) -> Result<(), String> {
+    run_command(
+        "apt-get",
+        &[
+            "install",
+            "-y",
+            "-o",
+            "DEBIAN_FRONTEND=noninteractive",
+            "libcap2-bin",
+        ],
+    )
+    .ok();
+    let path = binary
+        .to_str()
+        .ok_or("invalid binary path for capability grant")?;
+    if run_command("setcap", &["cap_net_bind_service=+ep", path]).is_err() {
+        eprintln!(
+            "warning: could not grant port 80/443 binding to {path}; \
+             ensure konnector runs under systemd"
+        );
+    }
     Ok(())
 }
 
@@ -451,7 +511,7 @@ fn release_package_url(release: GithubRelease) -> Result<String, String> {
     if let Some(url) = release
         .assets
         .iter()
-        .find(|asset| asset.name.starts_with("konnector-v") && asset.name.ends_with(".tar.gz"))
+        .find(|asset| asset.name.starts_with("konnector_") && asset.name.ends_with("_amd64.deb"))
         .map(|asset| asset.browser_download_url.clone())
     {
         return Ok(url);
@@ -459,7 +519,7 @@ fn release_package_url(release: GithubRelease) -> Result<String, String> {
     release
         .assets
         .iter()
-        .find(|asset| asset.name.starts_with("konnector_") && asset.name.ends_with("_amd64.deb"))
+        .find(|asset| asset.name.starts_with("konnector-v") && asset.name.ends_with(".tar.gz"))
         .map(|asset| asset.browser_download_url.clone())
         .ok_or_else(|| format!("no release package found for {}", release.tag_name))
 }
@@ -527,7 +587,8 @@ fn install_deb_package(path: &Path) -> Result<(), String> {
 fn install_package(source: &str) -> Result<(), String> {
     if source.starts_with("http://") || source.starts_with("https://") || Path::new(source).is_file() {
         if is_deb_package(source) {
-            let package = temp_path("konnector-package");
+            let mut package = temp_path("konnector-package");
+            package.set_extension("deb");
             download_file(source, &package)?;
             return install_deb_package(&package);
         }
@@ -572,6 +633,7 @@ fn install_tarball(source: &str) -> Result<(), String> {
                 .ok_or("invalid binary path")?,
         ],
     )?;
+    grant_bind_capability(&release_dir.join(PACKAGE))?;
     run_command(
         "chown",
         &[
@@ -722,6 +784,9 @@ fn cmd_update(args: &[String]) -> Result<(), String> {
     let source = resolve_release_source(reference.as_deref())?;
     println!("Updating from: {source}");
     install_package(&source)?;
+    if package_installed() {
+        run_command("systemctl", &["restart", SERVICE]).ok();
+    }
     println!("Konnector updated.");
     Ok(())
 }
@@ -808,6 +873,7 @@ fn cmd_init() -> Result<(), String> {
         fs::copy(&binary, release_dir.join(PACKAGE))
             .map_err(|error| format!("cannot install runtime binary: {error}"))?;
         copy_configs_to(&release_dir)?;
+        grant_bind_capability(&release_dir.join(PACKAGE))?;
         run_command(
             "chown",
             &[
@@ -988,6 +1054,27 @@ mod tests {
         assert!(is_local_package("konnector-v0.1.0.tar.gz"));
         assert!(is_local_package("konnector_0.1.0-1_amd64.deb"));
         assert!(!is_local_package("v0.1.0"));
+    }
+
+    #[test]
+    fn prefers_deb_over_tarball() {
+        let release = GithubRelease {
+            tag_name: "v0.1.0".to_owned(),
+            assets: vec![
+                GithubAsset {
+                    name: "konnector-v0.1.0.tar.gz".to_owned(),
+                    browser_download_url: "https://example.com/konnector.tar.gz".to_owned(),
+                },
+                GithubAsset {
+                    name: "konnector_0.1.0-1_amd64.deb".to_owned(),
+                    browser_download_url: "https://example.com/konnector.deb".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(
+            release_package_url(release).unwrap(),
+            "https://example.com/konnector.deb"
+        );
     }
 
     #[test]

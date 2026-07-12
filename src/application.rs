@@ -1,26 +1,28 @@
 use crate::{
     config_watcher,
-    configs::{self, ProxyTarget},
-    proxy::{DomainProxy, SiteRuntime, UpstreamRuntime},
-    ssl, ssl_watcher, upstreams, validation,
+    configs,
+    proxy::{build_proxy_routing, shared, DomainProxy},
+    ssl, ssl_watcher, validation,
 };
-use pingora::{cache::MemCache, prelude::*};
+use pingora::prelude::*;
 use std::sync::Arc;
 
 pub fn run() {
-    env_logger::init();
+    init_logging();
+    configs::warn_root_file(&configs::config_dir());
+    let sites = validation::filter_valid_sites(configs::load_sites_lenient());
+    if sites.is_empty() {
+        log::warn!("no valid site configs loaded; working page will be used for unmatched hosts");
+    }
     let root = configs::server();
-    let sites =
-        configs::load_sites().unwrap_or_else(|error| panic!("configuration error: {error}"));
+    if let Err(error) = validation::validate_server(&root, &sites) {
+        log::error!("server configuration issue: {error}");
+    }
     let provider = configs::tls_provider();
     if let Some(https) = &root.https {
         ssl::ensure_valid_certificate(https, &sites, &provider)
             .unwrap_or_else(|error| panic!("TLS certificate error: {error}"));
     }
-    validation::validate(&root, &sites)
-        .unwrap_or_else(|error| panic!("configuration error: {error}"));
-    config_watcher::start(root.clone());
-    ssl_watcher::start(root.clone(), sites.clone());
 
     let mut server = Server::new(None).expect("failed to create server");
     {
@@ -30,64 +32,16 @@ pub fn run() {
     }
     server.bootstrap();
 
-    let mut runtimes = Vec::with_capacity(sites.len());
-    for site in sites {
-        let primary_domain = site.primary_domain().to_owned();
-        let target = match site.target {
-            ProxyTarget::Direct { upstream } => UpstreamRuntime::Direct(upstream),
-            ProxyTarget::LoadBalanced {
-                upstreams: pool,
-                health_check,
-                health_check_interval_seconds,
-            } => {
-                let load_balancer = upstreams::create_load_balancer(
-                    &primary_domain,
-                    &pool,
-                    health_check,
-                    health_check_interval_seconds,
-                );
-                let background =
-                    background_service(&format!("{primary_domain} health check"), load_balancer);
-                let runtime = UpstreamRuntime::LoadBalanced {
-                    upstreams: pool,
-                    load_balancer: background.task(),
-                };
-                server.add_service(background);
-                runtime
-            }
-        };
-        runtimes.push(SiteRuntime {
-            domains: site.domains,
-            target,
-            internal_routes: site.internal_routes,
-            redirects: site.redirects,
-            access: site.access,
-            cache: site.cache,
-            cache_storage: Box::leak(Box::new(MemCache::new())),
-            forwarding: site.forwarding,
-        });
-    }
+    let routing = shared(build_proxy_routing(
+        sites.clone(),
+        root.root_proxy.clone(),
+        root.logging,
+        Some(&mut server),
+    ));
+    config_watcher::start(routing.clone());
+    ssl_watcher::start(root.clone(), sites);
 
-    let root_site = root.root_proxy.map(|root_proxy| {
-        let index = runtimes.len();
-        runtimes.push(SiteRuntime {
-            domains: Vec::new(),
-            target: UpstreamRuntime::Direct(root_proxy),
-            internal_routes: Vec::new(),
-            redirects: Vec::new(),
-            access: configs::AccessPolicy::All,
-            cache: configs::CacheConfig {
-                enabled: false,
-                max_file_bytes: 0,
-            },
-            cache_storage: Box::leak(Box::new(MemCache::new())),
-            forwarding: configs::ForwardingConfig::Direct,
-        });
-        index
-    });
-
-    let mut service =
-        http_proxy_service(&server.configuration, DomainProxy::new(runtimes, root_site));
+    let mut service = http_proxy_service(&server.configuration, DomainProxy::new(routing));
     assert_port_available(&root.http_listen);
     service.add_tcp(&root.http_listen);
     if let Some(https) = root.https {
@@ -104,18 +58,53 @@ pub fn run() {
     server.run_forever();
 }
 
+fn init_logging() {
+    use env_logger::{Builder, Env};
+    Builder::from_env(Env::default().default_filter_or("info"))
+        .filter_module("pingora", log::LevelFilter::Off)
+        .filter_module("pingora_proxy", log::LevelFilter::Off)
+        .filter_module("pingora_core", log::LevelFilter::Off)
+        .filter_module("pingora_cache", log::LevelFilter::Off)
+        .filter_module("pingora_load_balancing", log::LevelFilter::Off)
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(
+                buf,
+                "[{} konnector] {}",
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+}
+
 fn assert_port_available(addr: &str) {
     match std::net::TcpListener::bind(addr) {
         Ok(listener) => drop(listener),
         Err(error) => {
+            let port = addr.rsplit_once(':').map(|(_, port)| port).unwrap_or("80");
+            let hint = if error.raw_os_error() == Some(13) {
+                "Permission denied binding to a privileged port.\n\
+                 Do not start the proxy with bare `konnector`. Use:\n\
+                   sudo systemctl start konnector\n\
+                   konnector status\n\
+                 Or grant the capability:\n\
+                   sudo apt install -y libcap2-bin\n\
+                   sudo setcap cap_net_bind_service=+ep /opt/konnector/current/konnector"
+            } else if error.raw_os_error() == Some(98) {
+                "Port {port} is already in use. Konnector may already be running.\n\
+                 Use CLI commands instead of starting a second instance:\n\
+                   konnector status\n\
+                   konnector health\n\
+                   sudo systemctl restart konnector"
+            } else {
+                "Check which process owns the port:\n\
+                   sudo ss -tlnp | grep ':{port} '"
+            };
             eprintln!(
-                "Cannot bind {addr}: {error}\n\
-                 Another process is already using this port.\n\
-                 Stop it first:\n\
-                   pkill -f konnector\n\
+                "Cannot bind {addr}: {error}\n{hint}\n\
                  Then check the port is free:\n\
-                   lsof -i :{port}",
-                port = addr.rsplit_once(':').map(|(_, port)| port).unwrap_or("80")
+                   sudo ss -tlnp | grep ':{port} '",
             );
             std::process::exit(1);
         }

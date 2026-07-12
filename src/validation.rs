@@ -4,7 +4,23 @@ use crate::configs::{
 use crate::ssl;
 use std::{collections::HashSet, path::Path};
 
-pub fn validate(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), String> {
+pub fn filter_valid_sites(sites: Vec<SiteConfig>) -> Vec<SiteConfig> {
+    let mut domains = HashSet::new();
+    let mut valid = Vec::new();
+    for site in sites {
+        let mut trial = domains.clone();
+        match validate_site(&site, &mut trial) {
+            Ok(()) => {
+                domains = trial;
+                valid.push(site);
+            }
+            Err(error) => log::error!("skipping {}: {error}", site.primary_domain()),
+        }
+    }
+    valid
+}
+
+pub fn validate_server(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), String> {
     if root.threads == 0 {
         return Err("threads must be greater than zero".into());
     }
@@ -39,6 +55,12 @@ pub fn validate(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), String>
         }
         validate_ca(root_proxy)?;
     }
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn validate(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), String> {
+    validate_server(root, sites)?;
     if sites.is_empty() {
         return Err("at least one site config is required".into());
     }

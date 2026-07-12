@@ -21,7 +21,8 @@ Depends: ${misc:Depends},
          systemd,
          curl,
          ca-certificates,
+         libcap2-bin,
          gnupg
 Description: Konnector reverse proxy
- High-performance domain reverse proxy built on Cloudflare Pingora.
- Ships with YAML site configuration, TLS watching, and systemd integration.
+ High-performance domain reverse proxy with YAML site configuration,
+ TLS watching, and systemd integration.

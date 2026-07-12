@@ -3,6 +3,8 @@ set -eu
 
 case "${1}" in
   configure)
+    KONNECTOR_VERSION="$(dpkg-query -W -f='${Version}' konnector 2>/dev/null || echo manual)"
+    export KONNECTOR_VERSION
     /usr/bin/konnector init
     ;;
   abort-upgrade|abort-remove|abort-deconfigure)

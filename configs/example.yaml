@@ -22,3 +22,8 @@ cache:
   enabled: false
 
 forwarding: direct
+
+# Request logging for this site (off, error, warn, info, debug).
+# Omit to inherit the default from root.yaml.
+logging:
+  level: info

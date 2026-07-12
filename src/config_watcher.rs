@@ -1,8 +1,9 @@
-use crate::{configs, validation};
+use crate::proxy::{reload_routing, SharedRouting};
+use crate::configs;
 use notify::{RecursiveMode, Watcher};
 use std::{sync::mpsc, thread, time::Duration};
 
-pub fn start(_root: configs::ServerConfig) {
+pub fn start(routing: SharedRouting) {
     let directory = configs::config_dir();
     thread::Builder::new()
         .name("config-watcher".to_owned())
@@ -26,26 +27,10 @@ pub fn start(_root: configs::ServerConfig) {
                     log::warn!("configuration watch error: {error}");
                     continue;
                 }
-                // Editors and deployment tools commonly emit several events for
-                // one atomic file replacement. Wait until writes settle.
                 thread::sleep(Duration::from_millis(750));
                 while receiver.try_recv().is_ok() {}
 
-                match configs::load_sites_from(&directory).and_then(|sites| {
-                    let root = configs::server();
-                    validation::validate(&root, &sites)
-                })
-                {
-                    Ok(()) => {
-                        log::info!("valid configuration change detected; restarting");
-                        // systemd Restart=on-failure starts a fresh process that
-                        // builds all proxy and health-check services consistently.
-                        std::process::exit(75);
-                    }
-                    Err(error) => {
-                        log::warn!("configuration change rejected: {error}");
-                    }
-                }
+                reload_routing(&routing);
             }
         })
         .unwrap_or_else(|error| panic!("cannot start config watcher: {error}"));

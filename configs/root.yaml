@@ -1,2 +1,14 @@
+# Fallback for requests that do not match any site domain.
+# When this file is missing or empty, root proxy defaults to disabled.
+# When disabled, visitors see the "Server is working" page.
+# enabled: false
+
+# Global default for request logging (off, error, warn, info, debug).
+# Site configs can override with their own logging.level.
+logging:
+  level: off
+
+# Enable and set your upstream when you want IP/unmatched hosts proxied:
+enabled: true
 upstream:
   instance: 127.0.0.1:3000

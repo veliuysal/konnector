@@ -1,7 +1,7 @@
-use super::{RequestContext, SiteRuntime};
+use super::{routing::snapshot, routing::SharedRouting, RequestContext};
 use crate::{
     access_control, cache_policy, default_site, domain_routing, error_pages,
-    forwarding, health_check, path_rewrite, redirects, upstreams,
+    forwarding, health_check, path_rewrite, redirects, request_logging, upstreams,
 };
 use async_trait::async_trait;
 use pingora::{cache::CacheKey, prelude::*, proxy::FailToProxy};
@@ -9,13 +9,12 @@ use pingora::{cache::CacheKey, prelude::*, proxy::FailToProxy};
 const DOWNSTREAM_KEEPALIVE_SECS: u64 = 75;
 
 pub struct DomainProxy {
-    sites: Vec<SiteRuntime>,
-    root_site: Option<usize>,
+    routing: SharedRouting,
 }
 
 impl DomainProxy {
-    pub fn new(sites: Vec<SiteRuntime>, root_site: Option<usize>) -> Self {
-        Self { sites, root_site }
+    pub fn new(routing: SharedRouting) -> Self {
+        Self { routing }
     }
 }
 
@@ -27,27 +26,30 @@ impl ProxyHttp for DomainProxy {
         RequestContext::default()
     }
 
-    async fn early_request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+    async fn early_request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
         session.set_keepalive(Some(DOWNSTREAM_KEEPALIVE_SECS));
+        ctx.mark_started();
         Ok(())
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         if health_check::respond(session).await? {
+            ctx.skip_access_log = true;
             return Ok(true);
         }
-        let Some(site_index) = domain_routing::site_for(session, &self.sites) else {
-            if let Some(root_site) = self.root_site {
+        let routing = snapshot(&self.routing);
+        let Some(site_index) = domain_routing::site_for(session, &routing.sites) else {
+            if let Some(root_site) = routing.root_site {
                 ctx.site = Some(root_site);
                 return Ok(false);
             }
             return default_site::respond(session).await;
         };
         ctx.site = Some(site_index);
-        if redirects::apply(session, &self.sites[site_index]).await? {
+        if redirects::apply(session, &routing.sites[site_index]).await? {
             return Ok(true);
         }
-        access_control::reject_disallowed(session, ctx, &self.sites).await
+        access_control::reject_disallowed(session, ctx, &routing.sites).await
     }
 
     async fn upstream_peer(
@@ -55,14 +57,15 @@ impl ProxyHttp for DomainProxy {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        let routing = snapshot(&self.routing);
         let site_index = ctx
             .site
-            .or_else(|| domain_routing::site_for(session, &self.sites))
-            .or(self.root_site)
+            .or_else(|| domain_routing::site_for(session, &routing.sites))
+            .or(routing.root_site)
             .ok_or_else(|| Error::explain(ErrorType::InternalError, "root proxy is disabled"))?;
         ctx.site = Some(site_index);
         upstreams::select_peer(
-            &self.sites[site_index],
+            &routing.sites[site_index],
             session.req_header().uri.path(),
             ctx,
         )
@@ -75,9 +78,10 @@ impl ProxyHttp for DomainProxy {
         request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        forwarding::apply(session, request, ctx, &self.sites).await?;
-        upstreams::apply_request_transform(&self.sites, request, ctx).await?;
-        path_rewrite::prepare(session, ctx, &self.sites).await;
+        let routing = snapshot(&self.routing);
+        forwarding::apply(session, request, ctx, &routing.sites).await?;
+        upstreams::apply_request_transform(&routing.sites, request, ctx).await?;
+        path_rewrite::prepare(session, ctx, &routing.sites).await;
         Ok(())
     }
 
@@ -101,19 +105,40 @@ impl ProxyHttp for DomainProxy {
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
-        cache_policy::configure_request(session, ctx, &self.sites)
+        let routing = snapshot(&self.routing);
+        cache_policy::configure_request(session, ctx, &routing.sites)
     }
 
     fn cache_key_callback(&self, session: &Session, ctx: &mut Self::CTX) -> Result<CacheKey> {
-        cache_policy::cache_key(session, ctx, &self.sites)
+        let routing = snapshot(&self.routing);
+        cache_policy::cache_key(session, ctx, &routing.sites)
+    }
+
+    async fn logging(&self, session: &mut Session, error: Option<&Error>, ctx: &mut Self::CTX) {
+        let routing = snapshot(&self.routing);
+        request_logging::log_request(
+            session,
+            ctx,
+            &routing.sites,
+            routing.default_logging,
+            error,
+        );
     }
 
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
         error: &Error,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> FailToProxy {
+        let routing = snapshot(&self.routing);
+        request_logging::log_proxy_failure(
+            session,
+            ctx,
+            &routing.sites,
+            routing.default_logging,
+            error,
+        );
         error_pages::respond_to_proxy_failure(session, error).await
     }
 }

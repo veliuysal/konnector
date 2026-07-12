@@ -4,9 +4,10 @@ use pingora::prelude::*;
 const PAGE: &str = r#"<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Server is working</title></head>
-<body style="font-family:sans-serif;max-width:720px;margin:5rem auto;padding:0 1rem">
-<h1>Server is working</h1><p>No root proxy is configured.</p>
+<title>Konnector</title></head>
+<body style="font-family:sans-serif;max-width:720px;margin:5rem auto;padding:0 1rem;text-align:center">
+<h1>Server is working</h1>
+<p>Konnector is running. Add a site config to serve your application.</p>
 </body></html>"#;
 
 pub async fn respond(session: &mut Session) -> Result<bool> {

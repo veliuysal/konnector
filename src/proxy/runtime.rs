@@ -1,6 +1,6 @@
 use crate::{
     configs::{
-        AccessPolicy, CacheConfig, ForwardingConfig, InternalRouteConfig, RedirectRule,
+        AccessPolicy, CacheConfig, ForwardingConfig, InternalRouteConfig, LogLevel, RedirectRule,
         UpstreamConfig,
     },
     path_rewrite::PathRewriteState,
@@ -20,6 +20,7 @@ pub struct SiteRuntime {
     pub cache: CacheConfig,
     pub cache_storage: &'static MemCache,
     pub forwarding: ForwardingConfig,
+    pub logging: LogLevel,
 }
 
 impl SiteRuntime {
@@ -54,4 +55,6 @@ pub struct RequestContext {
     pub upstream: Option<usize>,
     pub internal_route: Option<usize>,
     pub path_rewrite: Option<PathRewriteState>,
+    pub skip_access_log: bool,
+    pub started_at: Option<std::time::Instant>,
 }

@@ -367,6 +367,7 @@ mod tests {
                 access: crate::configs::AccessPolicy::All,
                 cache: crate::configs::CacheConfig::default(),
                 forwarding: crate::configs::ForwardingConfig::Cloudflare,
+                logging: None,
             },
         ];
         assert_eq!(proxied_tls_domains(&sites), vec!["example.com".to_owned()]);
