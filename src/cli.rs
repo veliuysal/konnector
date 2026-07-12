@@ -507,15 +507,48 @@ fn github_api_release(path: &str) -> Result<GithubRelease, String> {
     serde_json::from_str(&body).map_err(|error| format!("invalid GitHub release response: {error}"))
 }
 
+fn tag_version(tag: &str) -> String {
+    normalize_tag(tag)
+        .trim_start_matches('v')
+        .to_owned()
+}
+
 fn release_package_url(release: GithubRelease) -> Result<String, String> {
-    if let Some(url) = release
+    let version = tag_version(&release.tag_name);
+    let deb_prefix = format!("konnector_{version}-");
+    let deb_assets = release
         .assets
         .iter()
-        .find(|asset| asset.name.starts_with("konnector_") && asset.name.ends_with("_amd64.deb"))
-        .map(|asset| asset.browser_download_url.clone())
+        .filter(|asset| asset.name.starts_with("konnector_") && asset.name.ends_with("_amd64.deb"))
+        .collect::<Vec<_>>();
+
+    if let Some(asset) = deb_assets
+        .iter()
+        .find(|asset| asset.name.starts_with(&deb_prefix))
     {
-        return Ok(url);
+        return Ok(asset.browser_download_url.clone());
     }
+
+    if deb_assets.len() == 1 {
+        let asset = deb_assets[0];
+        return Err(format!(
+            "release {} has {} but expected {}; rebuild the release with a matching package version",
+            release.tag_name, asset.name, deb_prefix
+        ));
+    }
+
+    if deb_assets.len() > 1 {
+        let names = deb_assets
+            .iter()
+            .map(|asset| asset.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "release {} has multiple .deb packages ({names}) but none match expected {}",
+            release.tag_name, deb_prefix
+        ));
+    }
+
     release
         .assets
         .iter()
@@ -1044,6 +1077,12 @@ mod tests {
     }
 
     #[test]
+    fn tag_version_strips_v_prefix() {
+        assert_eq!(tag_version("v0.1.1"), "0.1.1");
+        assert_eq!(tag_version("0.1.1"), "0.1.1");
+    }
+
+    #[test]
     fn normalizes_release_tags() {
         assert_eq!(normalize_tag("0.1.0"), "v0.1.0");
         assert_eq!(normalize_tag("v0.1.0"), "v0.1.0");
@@ -1054,6 +1093,44 @@ mod tests {
         assert!(is_local_package("konnector-v0.1.0.tar.gz"));
         assert!(is_local_package("konnector_0.1.0-1_amd64.deb"));
         assert!(!is_local_package("v0.1.0"));
+    }
+
+    #[test]
+    fn selects_deb_matching_release_tag() {
+        let release = GithubRelease {
+            tag_name: "v0.1.1".to_owned(),
+            assets: vec![
+                GithubAsset {
+                    name: "konnector_0.1.0-1_amd64.deb".to_owned(),
+                    browser_download_url:
+                        "https://example.com/konnector_0.1.0-1_amd64.deb".to_owned(),
+                },
+                GithubAsset {
+                    name: "konnector_0.1.1-1_amd64.deb".to_owned(),
+                    browser_download_url:
+                        "https://example.com/konnector_0.1.1-1_amd64.deb".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(
+            release_package_url(release).unwrap(),
+            "https://example.com/konnector_0.1.1-1_amd64.deb"
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_deb_for_tagged_release() {
+        let release = GithubRelease {
+            tag_name: "v0.1.1".to_owned(),
+            assets: vec![GithubAsset {
+                name: "konnector_0.1.0-1_amd64.deb".to_owned(),
+                browser_download_url:
+                    "https://example.com/konnector_0.1.0-1_amd64.deb".to_owned(),
+            }],
+        };
+        let error = release_package_url(release).unwrap_err();
+        assert!(error.contains("v0.1.1"));
+        assert!(error.contains("konnector_0.1.0-1_amd64.deb"));
     }
 
     #[test]

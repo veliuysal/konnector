@@ -22,7 +22,16 @@ fi
 
 RELEASE_JSON="$(curl -fsSL -H "Accept: application/vnd.github+json" "${RELEASE_URL}")"
 
-DEB_URL="$(printf '%s\n' "${RELEASE_JSON}" | sed -n 's/.*"browser_download_url": "\([^"]*_amd64\.deb\)".*/\1/p' | head -1)"
+if [ -n "${KONNECTOR_VERSION:-}" ]; then
+  VERSION="${KONNECTOR_VERSION#v}"
+  DEB_URL="$(printf '%s\n' "${RELEASE_JSON}" | sed -n "s/.*\"browser_download_url\": \"\\([^\"]*konnector_${VERSION}[^\"]*_amd64\\.deb\\)\".*/\\1/p" | head -1)"
+  if [ -z "${DEB_URL}" ]; then
+    echo "no .deb matching version ${KONNECTOR_VERSION} found in ${RELEASE_URL}" >&2
+    exit 1
+  fi
+else
+  DEB_URL="$(printf '%s\n' "${RELEASE_JSON}" | sed -n 's/.*"browser_download_url": "\([^"]*_amd64\.deb\)".*/\1/p' | head -1)"
+fi
 
 if [ -z "${DEB_URL}" ]; then
   echo "no .deb package found in ${RELEASE_URL}" >&2
