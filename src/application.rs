@@ -1,6 +1,7 @@
 use crate::{
     config_watcher,
     configs,
+    file_log,
     proxy::{build_proxy_routing, shared, DomainProxy},
     ssl, ssl_watcher, tcp_proxy::TcpProxyManager, validation,
 };
@@ -8,6 +9,7 @@ use pingora::prelude::*;
 use std::sync::Arc;
 
 pub fn run() {
+    file_log::init();
     init_logging();
     configs::warn_root_file(&configs::config_dir());
     let sites = validation::filter_valid_sites(configs::load_sites_lenient());
@@ -87,7 +89,7 @@ pub fn run() {
 }
 
 fn init_logging() {
-    use env_logger::{Builder, Env};
+    use env_logger::{Builder, Env, Target};
     use std::io::Write;
 
     let mut builder = Builder::from_env(Env::default().default_filter_or("info"));
@@ -96,31 +98,18 @@ fn init_logging() {
         .filter_module("pingora_proxy", log::LevelFilter::Off)
         .filter_module("pingora_core", log::LevelFilter::Off)
         .filter_module("pingora_cache", log::LevelFilter::Off)
-        .filter_module("pingora_load_balancing", log::LevelFilter::Off);
-
-    #[cfg(windows)]
-    {
-        use env_logger::Target;
-        use std::fs::OpenOptions;
-        if std::env::var_os("KONNECTOR_SERVICE").is_some() {
-            let log_path = crate::paths::log_file();
-            if let Some(parent) = log_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-                builder.target(Target::Pipe(Box::new(file)));
-            }
-        }
-    }
-
-    builder
+        .filter_module("pingora_load_balancing", log::LevelFilter::Off)
+        .target(Target::Pipe(Box::new(file_log::MainTee::new())))
         .format(|buf, record| {
             writeln!(
                 buf,
                 "[{} konnector] {}",
                 record.level(),
                 record.args()
-            )
+            )?;
+            // systemd captures stderr as a pipe; flush so watcher/startup lines
+            // show up immediately instead of waiting for a later burst of logs.
+            buf.flush()
         })
         .init();
 }

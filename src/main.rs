@@ -10,6 +10,7 @@ mod default_site;
 mod domain_routing;
 mod env_file;
 mod error_pages;
+mod file_log;
 mod forwarding;
 mod health_check;
 mod http3;

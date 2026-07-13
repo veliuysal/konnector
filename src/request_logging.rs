@@ -1,9 +1,14 @@
 use crate::{
     configs::{LogLevel, UpstreamConfig},
+    file_log,
     proxy::{RequestContext, SiteRuntime},
 };
 use pingora::prelude::*;
-use std::{net::SocketAddr, time::{Duration, Instant}};
+use std::{
+    io::Write,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 pub fn access_logging_enabled(level: LogLevel) -> bool {
     level.is_enabled()
@@ -25,6 +30,37 @@ pub fn log_level_for(
         .get(index)
         .map(|site| site.logging)
         .unwrap_or(default)
+}
+
+fn site_log_name(
+    ctx: &RequestContext,
+    sites: &[SiteRuntime],
+    root_site: Option<usize>,
+) -> String {
+    let Some(index) = ctx.site else {
+        return "root".to_owned();
+    };
+    if root_site == Some(index) {
+        return "root".to_owned();
+    }
+    sites
+        .get(index)
+        .map(|site| {
+            if site.source_file.is_empty() {
+                site.primary_domain().to_owned()
+            } else {
+                site.source_file.clone()
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn emit_access(site_name: &str, message: &str) {
+    let line = file_log::format_line("INFO", message);
+    // Journal/stderr only — keep access traffic out of logs/main.
+    let _ = writeln!(std::io::stderr(), "{line}");
+    let _ = std::io::stderr().flush();
+    file_log::write_site(site_name, &line);
 }
 
 pub fn log_request(
@@ -49,6 +85,7 @@ pub fn log_request(
         .map_or(0, |response| response.status.as_u16());
     let summary = session.as_ref().request_summary();
     let http_version = upstream_http_version(ctx, sites);
+    let site_name = site_log_name(ctx, sites, root_site);
 
     if level.is_debug() {
         let upstream = upstream_summary(ctx, sites);
@@ -56,23 +93,25 @@ pub fn log_request(
             .started_at
             .map(|started| started.elapsed().as_millis())
             .unwrap_or(0);
-        if let Some(error) = error {
-            log::info!(
+        let message = if let Some(error) = error {
+            format!(
                 "{summary} -> {status} ({duration_ms}ms) upstream={upstream} http={http_version} error={error}"
-            );
+            )
         } else {
-            log::info!(
+            format!(
                 "{summary} -> {status} ({duration_ms}ms) upstream={upstream} http={http_version}"
-            );
-        }
+            )
+        };
+        emit_access(&site_name, &message);
         return;
     }
 
-    if let Some(error) = error {
-        log::info!("{summary} -> {status} http={http_version} error={error}");
+    let message = if let Some(error) = error {
+        format!("{summary} -> {status} http={http_version} error={error}")
     } else {
-        log::info!("{summary} -> {status} http={http_version}");
-    }
+        format!("{summary} -> {status} http={http_version}")
+    };
+    emit_access(&site_name, &message);
 }
 
 pub fn log_proxy_started(
@@ -92,11 +131,16 @@ pub fn log_proxy_started(
     let summary = session.as_ref().request_summary();
     let upstream = upstream_summary(ctx, sites);
     let http_version = upstream_http_version(ctx, sites);
-    log::info!("{summary} proxy upstream={upstream} http={http_version}");
+    let site_name = site_log_name(ctx, sites, root_site);
+    emit_access(
+        &site_name,
+        &format!("{summary} proxy upstream={upstream} http={http_version}"),
+    );
 }
 
 pub fn log_tcp_connection(
     name: &str,
+    source_file: &str,
     client: SocketAddr,
     upstream: &str,
     bytes_up: u64,
@@ -105,14 +149,20 @@ pub fn log_tcp_connection(
     error: Option<&str>,
 ) {
     let duration_ms = duration.as_millis();
-    match error {
-        Some(error) => log::info!(
+    let message = match error {
+        Some(error) => format!(
             "TCP {name} {client} -> {upstream} ({duration_ms}ms) up={bytes_up} down={bytes_down} error={error}"
         ),
-        None => log::info!(
+        None => format!(
             "TCP {name} {client} -> {upstream} ({duration_ms}ms) up={bytes_up} down={bytes_down}"
         ),
-    }
+    };
+    let folder = if source_file.is_empty() {
+        name
+    } else {
+        source_file
+    };
+    emit_access(folder, &message);
 }
 
 fn selected_upstream<'a>(
@@ -175,6 +225,7 @@ mod tests {
             cache_storage: Box::leak(Box::new(pingora::cache::MemCache::new())),
             forwarding: Default::default(),
             logging: LogLevel::Off,
+            source_file: "root".to_owned(),
         }];
         let ctx = RequestContext {
             site: Some(0),
@@ -238,6 +289,7 @@ mod tests {
             cache_storage: Box::leak(Box::new(pingora::cache::MemCache::new())),
             forwarding: Default::default(),
             logging: LogLevel::Info,
+            source_file: "example".to_owned(),
         }];
         let ctx = RequestContext {
             site: Some(0),

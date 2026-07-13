@@ -62,14 +62,18 @@ pub fn ssl_dir() -> PathBuf {
     }
 }
 
-#[cfg(windows)]
 pub fn logs_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("LOGS_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     data_dir().join("logs")
 }
 
-#[cfg(windows)]
 pub fn log_file() -> PathBuf {
-    logs_dir().join("konnector.log")
+    logs_dir().join("main").join("konnector.log")
 }
 
 pub fn default_config_dir() -> PathBuf {

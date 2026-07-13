@@ -109,7 +109,7 @@ Service:
   konnector disable
   konnector status
   konnector health
-  konnector logs [--follow] [--lines N]
+  konnector logs [--follow] [--lines N]   # main/konnector.log
 
 Release:
   konnector install [tag|package|release-url]

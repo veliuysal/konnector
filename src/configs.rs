@@ -63,6 +63,9 @@ pub struct SiteConfig {
     pub logging: Option<LoggingConfig>,
     #[serde(default)]
     pub http: HttpSettings,
+    /// Config file stem (`example` from `example.yaml`). Not part of YAML.
+    #[serde(skip)]
+    pub source_file: String,
 }
 
 impl SiteConfig {
@@ -314,12 +317,9 @@ pub fn server() -> ServerConfig {
     let (path, root) = load_root_settings(&directory);
     let (https, tls_provider) = resolve_tls_config(&root.tls);
     ServerConfig {
-        http_listen: env::var("HTTP_LISTEN").unwrap_or_else(|_| "0.0.0.0:80".to_owned()),
-        https_listen: env::var("HTTPS_LISTEN").unwrap_or_else(|_| "0.0.0.0:443".to_owned()),
-        threads: env::var("THREADS")
-            .ok()
-            .map(|value| value.parse().expect("THREADS must be a number"))
-            .unwrap_or_else(default_threads),
+        http_listen: env_string("HTTP_LISTEN", "0.0.0.0:80"),
+        https_listen: env_string("HTTPS_LISTEN", "0.0.0.0:443"),
+        threads: env_u64("THREADS", default_threads() as u64).max(1) as usize,
         https,
         tls_provider,
         root_proxy: root_proxy_from_env()
@@ -421,12 +421,21 @@ fn list_site_config_paths(directory: &Path) -> Result<Vec<PathBuf>, String> {
 fn load_site_file(path: &Path) -> Result<SiteConfig, String> {
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    serde_yaml::from_str(&raw)
-        .map_err(|error| format!("invalid YAML in {}: {error}", path.display()))
+    let mut site: SiteConfig = serde_yaml::from_str(&raw)
+        .map_err(|error| format!("invalid YAML in {}: {error}", path.display()))?;
+    site.source_file = config_stem(path);
+    Ok(site)
 }
 
-/// TLS flags from `root.yaml`. File paths are never set here — they come from env `TLS_DIR`:
-/// `{TLS_DIR}/fullchain.pem`, `{TLS_DIR}/privkey.pem`, `{TLS_DIR}/acme/`.
+fn config_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+/// TLS flags from `root.yaml`. File paths are never set here — they come from env `TLS_DIR`
+/// (default: platform SSL dir), which holds `fullchain.pem`, `privkey.pem`, and `acme/`.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootTlsConfig {
@@ -467,28 +476,25 @@ fn resolve_tls_config(yaml: &RootTlsSettings) -> (Option<HttpsConfig>, TlsProvid
         return (None, TlsProviderConfig::default());
     }
 
-    let tls_dir = env::var("TLS_DIR")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            panic!(
-                "TLS is enabled but TLS_DIR is not set; set the certificate root folder in the env file \
-                 (e.g. TLS_DIR=/etc/ssl/konnector)"
-            )
-        });
+    let tls_dir = env_string("TLS_DIR", &crate::paths::path_display(&crate::paths::ssl_dir()));
     let tls_root = PathBuf::from(&tls_dir);
     let certificate_path = tls_root.join(TLS_CERT_FILE).to_string_lossy().into_owned();
     let private_key_path = tls_root.join(TLS_KEY_FILE).to_string_lossy().into_owned();
 
-    let provider = match env::var("TLS_PROVIDER").as_deref() {
-        Ok("acme") | Ok("letsencrypt") => TlsProviderKind::Acme,
-        Ok("cloudflare") => TlsProviderKind::Cloudflare,
-        Ok("command") => TlsProviderKind::Command,
-        Ok("none") => TlsProviderKind::None,
-        Ok("") | Err(_) if yaml.auto => TlsProviderKind::Acme,
-        Ok("") | Err(_) => TlsProviderKind::None,
-        Ok(value) => panic!("invalid TLS_PROVIDER value: {value}"),
+    let provider = match env_string("TLS_PROVIDER", "").to_ascii_lowercase().as_str() {
+        "acme" | "letsencrypt" => TlsProviderKind::Acme,
+        "cloudflare" => TlsProviderKind::Cloudflare,
+        "command" => TlsProviderKind::Command,
+        "none" | "" if yaml.auto => TlsProviderKind::Acme,
+        "none" | "" => TlsProviderKind::None,
+        other => {
+            log::warn!("invalid TLS_PROVIDER value '{other}'; using default");
+            if yaml.auto {
+                TlsProviderKind::Acme
+            } else {
+                TlsProviderKind::None
+            }
+        }
     };
 
     (
@@ -498,12 +504,9 @@ fn resolve_tls_config(yaml: &RootTlsSettings) -> (Option<HttpsConfig>, TlsProvid
         }),
         TlsProviderConfig {
             provider,
-            cloudflare_api_token: env::var("CLOUDFLARE_API_TOKEN").ok(),
-            fetch_command: env::var("TLS_FETCH_COMMAND").ok(),
-            check_interval_seconds: env::var("TLS_CHECK_INTERVAL_SECONDS")
-                .ok()
-                .map(|value| value.parse().expect("TLS_CHECK_INTERVAL_SECONDS must be a number"))
-                .unwrap_or(21_600),
+            cloudflare_api_token: env_optional("CLOUDFLARE_API_TOKEN"),
+            fetch_command: env_optional("TLS_FETCH_COMMAND"),
+            check_interval_seconds: env_u64("TLS_CHECK_INTERVAL_SECONDS", 21_600),
             acme_staging: env_bool("ACME_STAGING", yaml.staging),
             tls_dir: Some(tls_dir),
         },
@@ -541,6 +544,9 @@ pub struct TcpProxyConfig {
     pub name: String,
     pub listen: String,
     pub upstream: TcpUpstreamConfig,
+    /// Config file stem (`postgres.tcp` from `postgres.tcp.yaml`). Not part of YAML.
+    #[serde(skip)]
+    pub source_file: String,
 }
 
 impl TcpProxyConfig {
@@ -606,11 +612,10 @@ pub(crate) fn load_tcp_from_lenient(directory: &Path) -> Vec<TcpProxyConfig> {
     for path in paths {
         match load_tcp_file(&path) {
             Ok(mut proxy) => {
+                proxy.source_file = config_stem(&path);
                 if proxy.name.is_empty() {
-                    proxy.name = path
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("tcp")
+                    proxy.name = proxy
+                        .source_file
                         .trim_end_matches(".tcp")
                         .to_owned();
                 }
@@ -640,8 +645,10 @@ fn list_tcp_config_paths(directory: &Path) -> Result<Vec<PathBuf>, String> {
 fn load_tcp_file(path: &Path) -> Result<TcpProxyConfig, String> {
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    serde_yaml::from_str(&raw)
-        .map_err(|error| format!("invalid YAML in {}: {error}", path.display()))
+    let mut proxy: TcpProxyConfig = serde_yaml::from_str(&raw)
+        .map_err(|error| format!("invalid YAML in {}: {error}", path.display()))?;
+    proxy.source_file = config_stem(path);
+    Ok(proxy)
 }
 
 fn normalize_listen_address(value: &str) -> Result<String, String> {
@@ -924,12 +931,56 @@ fn normalize_instance_address(value: &str, tls: bool) -> Result<String, String> 
     Ok(format!("{value}:{default_port}"))
 }
 
+fn env_string(name: &str, default: &str) -> String {
+    match env::var(name) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                default.to_owned()
+            } else {
+                trimmed.to_owned()
+            }
+        }
+        Err(_) => default.to_owned(),
+    }
+}
+
+fn env_optional(name: &str) -> Option<String> {
+    match env::var(name) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    match env::var(name) {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                log::warn!("invalid {name} value '{value}'; using default {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 fn env_bool(name: &str, default: bool) -> bool {
-    match env::var(name).as_deref() {
+    match env::var(name).as_deref().map(str::trim) {
         Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
         Ok("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
-        Err(_) => default,
-        Ok(value) => panic!("invalid {name} value: {value}"),
+        Ok("") | Err(_) => default,
+        Ok(value) => {
+            log::warn!("invalid {name} value '{value}'; using default {default}");
+            default
+        }
     }
 }
 
@@ -1021,6 +1072,26 @@ mod tests {
         assert!(upstream.enabled);
         assert!(upstream.upstream.is_none());
         assert!(upstream.proxy.is_none());
+    }
+
+    #[test]
+    fn root_tls_defaults_tls_dir_when_env_unset() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+tls:
+  enabled: true
+  auto: false
+"#,
+        )
+        .unwrap();
+        let settings = RootSettings::try_from(root).unwrap();
+        env::remove_var("TLS_DIR");
+        let (https, provider) = resolve_tls_config(&settings.tls);
+        let default_dir = crate::paths::path_display(&crate::paths::ssl_dir());
+        let https = https.expect("https enabled");
+        assert!(https.certificate_path.starts_with(&default_dir));
+        assert!(https.private_key_path.starts_with(&default_dir));
+        assert_eq!(provider.tls_dir.as_deref(), Some(default_dir.as_str()));
     }
 
     #[test]

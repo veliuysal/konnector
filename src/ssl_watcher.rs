@@ -1,4 +1,4 @@
-use crate::{configs, ssl};
+use crate::{configs, file_log, ssl};
 use notify::{RecursiveMode, Watcher};
 use std::{
     sync::mpsc::{self, RecvTimeoutError},
@@ -7,6 +7,15 @@ use std::{
 };
 
 const RESTART_EXIT_CODE: i32 = 75;
+
+fn watcher_log(level: &str, message: &str) {
+    match level {
+        "ERROR" => log::error!("{message}"),
+        "WARN" => log::warn!("{message}"),
+        _ => log::info!("{message}"),
+    }
+    file_log::write_watcher("tls", &file_log::format_line(level, message));
+}
 
 pub fn start(root: configs::ServerConfig, sites: Vec<configs::SiteConfig>) {
     let Some(https) = root.https.clone() else {
@@ -23,26 +32,54 @@ pub fn start(root: configs::ServerConfig, sites: Vec<configs::SiteConfig>) {
             let mut watcher = match notify::recommended_watcher(sender) {
                 Ok(watcher) => watcher,
                 Err(error) => {
-                    log::error!("cannot create TLS watcher: {error}");
+                    watcher_log("ERROR", &format!("cannot create TLS watcher: {error}"));
                     return;
                 }
             };
             for path in &watch_paths {
                 if let Err(error) = watcher.watch(path, RecursiveMode::NonRecursive) {
-                    log::error!("cannot watch {}: {error}", path.display());
+                    watcher_log(
+                        "ERROR",
+                        &format!("cannot watch {}: {error}", path.display()),
+                    );
                     return;
                 }
-                log::info!("watching TLS directory {}", path.display());
+                watcher_log(
+                    "INFO",
+                    &format!("watching TLS directory {}", path.display()),
+                );
             }
 
             loop {
                 match receiver.recv_timeout(check_interval) {
-                    Ok(Ok(_event)) => {
+                    Ok(Ok(event)) => {
+                        let paths = event
+                            .paths
+                            .iter()
+                            .map(|path| {
+                                path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| path.display().to_string())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let label = if paths.is_empty() {
+                            "unknown path".to_owned()
+                        } else {
+                            paths
+                        };
+                        watcher_log(
+                            "INFO",
+                            &format!("TLS file change detected ({label}); checking certificate"),
+                        );
                         thread::sleep(Duration::from_millis(750));
                         while receiver.try_recv().is_ok() {}
                         handle_tls_change(&https, &sites, &provider, "file change");
                     }
-                    Ok(Err(error)) => log::warn!("TLS watch error: {error}"),
+                    Ok(Err(error)) => {
+                        watcher_log("WARN", &format!("TLS watch error: {error}"));
+                    }
                     Err(RecvTimeoutError::Timeout) => {
                         handle_tls_change(&https, &sites, &provider, "scheduled check");
                     }
@@ -68,14 +105,20 @@ fn handle_tls_change(
             {
                 true
             } else if reason == "file change" {
-                log::info!("valid TLS certificate change detected; restarting");
+                watcher_log(
+                    "INFO",
+                    "valid TLS certificate change detected; restarting",
+                );
                 std::process::exit(RESTART_EXIT_CODE);
             } else {
                 false
             }
         }
         Err(error) => {
-            log::warn!("TLS certificate check failed during {reason}: {error}");
+            watcher_log(
+                "WARN",
+                &format!("TLS certificate check failed during {reason}: {error}"),
+            );
             true
         }
     };
@@ -85,12 +128,21 @@ fn handle_tls_change(
     match ssl::refresh_certificate(https, sites, provider) {
         Ok(()) => match ssl::validate_certificate_files(https, &domains) {
             Ok(()) => {
-                log::info!("TLS certificate refreshed successfully; restarting");
+                watcher_log(
+                    "INFO",
+                    "TLS certificate refreshed successfully; restarting",
+                );
                 std::process::exit(RESTART_EXIT_CODE);
             }
-            Err(error) => log::error!("refreshed TLS certificate is still invalid: {error}"),
+            Err(error) => watcher_log(
+                "ERROR",
+                &format!("refreshed TLS certificate is still invalid: {error}"),
+            ),
         },
-        Err(error) => log::error!("TLS certificate refresh failed: {error}"),
+        Err(error) => watcher_log(
+            "ERROR",
+            &format!("TLS certificate refresh failed: {error}"),
+        ),
     }
 }
 

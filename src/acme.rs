@@ -65,7 +65,7 @@ pub fn account_dir(provider: &TlsProviderConfig) -> PathBuf {
         .tls_dir
         .as_ref()
         .map(PathBuf::from)
-        .expect("TLS_DIR is required when ACME is enabled");
+        .unwrap_or_else(crate::paths::ssl_dir);
     root.join("acme")
 }
 

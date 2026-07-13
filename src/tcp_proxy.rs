@@ -64,15 +64,30 @@ impl TcpProxyManager {
         };
         let shutdown = Arc::new(AtomicBool::new(false));
         let name = config.name.clone();
+        let source_file = if config.source_file.is_empty() {
+            name.clone()
+        } else {
+            config.source_file.clone()
+        };
         let mut joins = Vec::with_capacity(listen_addrs.len());
         for listen in listen_addrs {
             let shutdown = shutdown.clone();
             let upstream = upstream.clone();
             let name = name.clone();
+            let source_file = source_file.clone();
             let thread_name = name.clone();
             let join = thread::Builder::new()
                 .name(format!("tcp-{name}"))
-                .spawn(move || run_listener(&thread_name, &listen, &upstream, shutdown, logging))
+                .spawn(move || {
+                    run_listener(
+                        &thread_name,
+                        &source_file,
+                        &listen,
+                        &upstream,
+                        shutdown,
+                        logging,
+                    )
+                })
                 .unwrap_or_else(|error| panic!("cannot start tcp proxy {name}: {error}"));
             joins.push(join);
         }
@@ -85,6 +100,7 @@ impl TcpProxyManager {
 
 fn run_listener(
     name: &str,
+    source_file: &str,
     listen: &str,
     upstream: &str,
     shutdown: Arc<AtomicBool>,
@@ -108,8 +124,9 @@ fn run_listener(
             Ok((client, address)) => {
                 let upstream = upstream.to_owned();
                 let name = name.to_owned();
+                let source_file = source_file.to_owned();
                 thread::spawn(move || {
-                    relay_connection(&name, client, &upstream, address, logging);
+                    relay_connection(&name, &source_file, client, &upstream, address, logging);
                 });
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -126,6 +143,7 @@ fn run_listener(
 
 fn relay_connection(
     name: &str,
+    source_file: &str,
     mut client: TcpStream,
     upstream: &str,
     client_addr: SocketAddr,
@@ -140,6 +158,7 @@ fn relay_connection(
             if log_enabled {
                 request_logging::log_tcp_connection(
                     name,
+                    source_file,
                     client_addr,
                     upstream,
                     0,
@@ -158,6 +177,7 @@ fn relay_connection(
             if log_enabled {
                 request_logging::log_tcp_connection(
                     name,
+                    source_file,
                     client_addr,
                     upstream,
                     0,
@@ -175,6 +195,7 @@ fn relay_connection(
             if log_enabled {
                 request_logging::log_tcp_connection(
                     name,
+                    source_file,
                     client_addr,
                     upstream,
                     0,
@@ -196,6 +217,7 @@ fn relay_connection(
             if log_enabled {
                 request_logging::log_tcp_connection(
                     name,
+                    source_file,
                     client_addr,
                     upstream,
                     0,
@@ -210,6 +232,7 @@ fn relay_connection(
             if log_enabled {
                 request_logging::log_tcp_connection(
                     name,
+                    source_file,
                     client_addr,
                     upstream,
                     0,
@@ -227,6 +250,7 @@ fn relay_connection(
             if log_enabled {
                 request_logging::log_tcp_connection(
                     name,
+                    source_file,
                     client_addr,
                     upstream,
                     bytes_up,
@@ -241,6 +265,7 @@ fn relay_connection(
             if log_enabled {
                 request_logging::log_tcp_connection(
                     name,
+                    source_file,
                     client_addr,
                     upstream,
                     bytes_up,
@@ -256,6 +281,7 @@ fn relay_connection(
     if log_enabled {
         request_logging::log_tcp_connection(
             name,
+            source_file,
             client_addr,
             upstream,
             bytes_up,

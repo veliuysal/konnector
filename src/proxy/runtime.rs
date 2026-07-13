@@ -21,6 +21,8 @@ pub struct SiteRuntime {
     pub cache_storage: &'static MemCache,
     pub forwarding: ForwardingConfig,
     pub logging: LogLevel,
+    /// YAML config stem used for `logs/{source_file}/access.log`.
+    pub source_file: String,
 }
 
 impl SiteRuntime {

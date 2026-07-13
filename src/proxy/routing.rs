@@ -47,6 +47,11 @@ pub fn build_proxy_routing(
             cache_storage: Box::leak(Box::new(MemCache::new())),
             forwarding: site.forwarding,
             logging,
+            source_file: if site.source_file.is_empty() {
+                primary_domain.clone()
+            } else {
+                site.source_file
+            },
         });
     }
 
@@ -66,6 +71,7 @@ pub fn build_proxy_routing(
             cache_storage: Box::leak(Box::new(MemCache::new())),
             forwarding: ForwardingConfig::Direct,
             logging: default_logging,
+            source_file: "root".to_owned(),
         });
         index
     });

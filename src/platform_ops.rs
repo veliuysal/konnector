@@ -3,14 +3,12 @@ use std::{
     collections::hash_map::DefaultHasher,
     fs,
     hash::{Hash, Hasher},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(windows)]
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
 const HEALTH_URL: &str = "http://127.0.0.1/_health";
 const KEEP_RELEASES: usize = 5;
@@ -233,15 +231,33 @@ pub fn ensure_layout() -> Result<(), String> {
     let releases = paths::path_display(&paths::releases_dir());
     let ssl = paths::path_display(&paths::ssl_dir());
     let data = paths::path_display(&paths::data_dir());
+    let logs = paths::path_display(&paths::logs_dir());
     for (path, mode) in [
         (app.as_str(), "755"),
         (releases.as_str(), "755"),
         (ssl.as_str(), "750"),
         (data.as_str(), "755"),
+        (logs.as_str(), "755"),
     ] {
         run_command(
             "install",
             &["-d", "-o", "konnector", "-g", "konnector", "-m", mode, path],
+        )?;
+    }
+    for sub in ["main", "watchers"] {
+        let path = paths::logs_dir().join(sub);
+        run_command(
+            "install",
+            &[
+                "-d",
+                "-o",
+                "konnector",
+                "-g",
+                "konnector",
+                "-m",
+                "755",
+                &paths::path_display(&path),
+            ],
         )?;
     }
     let env_path = paths::env_file();
@@ -516,14 +532,51 @@ pub fn cmd_status() -> Result<(), String> {
     )
 }
 
-#[cfg(unix)]
 pub fn cmd_logs(follow: bool, lines: &str) -> Result<(), String> {
-    require_service()?;
-    let mut command = vec!["-u", paths::SERVICE_NAME, "-n", lines, "--no-pager"];
-    if follow {
-        command.push("--follow");
+    let log_path = paths::log_file();
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).ok();
     }
-    run_command("journalctl", &command)
+    if !log_path.is_file() {
+        println!(
+            "No main log yet at {} (start the service and enable logging).",
+            paths::path_display(&log_path)
+        );
+        return Ok(());
+    }
+
+    let line_count: usize = lines.parse().unwrap_or(100);
+    let contents = fs::read_to_string(&log_path).unwrap_or_default();
+    let all_lines: Vec<&str> = contents.lines().collect();
+    let start = all_lines.len().saturating_sub(line_count);
+    for line in &all_lines[start..] {
+        println!("{line}");
+    }
+
+    if !follow {
+        return Ok(());
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .open(&log_path)
+        .map_err(|error| {
+            format!(
+                "cannot open {}: {error}",
+                paths::path_display(&log_path)
+            )
+        })?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|error| format!("cannot seek log file: {error}"))?;
+    let mut reader = BufReader::new(file);
+    loop {
+        let mut buffer = String::new();
+        match reader.read_line(&mut buffer) {
+            Ok(0) => thread::sleep(Duration::from_millis(500)),
+            Ok(_) => print!("{buffer}"),
+            Err(error) => return Err(format!("cannot read log file: {error}")),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -635,6 +688,8 @@ pub fn ensure_layout() -> Result<(), String> {
         paths::data_dir().join("configs"),
         paths::ssl_dir(),
         paths::logs_dir(),
+        paths::logs_dir().join("main"),
+        paths::logs_dir().join("watchers"),
     ] {
         fs::create_dir_all(&dir).map_err(|error| {
             format!(
@@ -1024,42 +1079,6 @@ pub fn cmd_status() -> Result<(), String> {
         paths::path_display(&config.executable_path)
     );
     Ok(())
-}
-
-#[cfg(windows)]
-pub fn cmd_logs(follow: bool, lines: &str) -> Result<(), String> {
-    ensure_layout()?;
-    let log_path = paths::log_file();
-    let line_count: usize = lines.parse().unwrap_or(100);
-
-    let contents = fs::read_to_string(&log_path).unwrap_or_default();
-    let all_lines: Vec<&str> = contents.lines().collect();
-    let start = all_lines.len().saturating_sub(line_count);
-    for line in &all_lines[start..] {
-        println!("{line}");
-    }
-
-    if !follow {
-        return Ok(());
-    }
-
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .open(&log_path)
-        .map_err(|error| format!("cannot open log file: {error}"))?;
-    file.seek(SeekFrom::End(0))
-        .map_err(|error| format!("cannot seek log file: {error}"))?;
-    let mut reader = BufReader::new(file);
-    loop {
-        let mut buffer = String::new();
-        match reader.read_line(&mut buffer) {
-            Ok(0) => thread::sleep(Duration::from_millis(500)),
-            Ok(_) => {
-                print!("{buffer}");
-            }
-            Err(error) => return Err(format!("cannot read log file: {error}")),
-        }
-    }
 }
 
 #[cfg(windows)]

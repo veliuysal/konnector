@@ -405,6 +405,7 @@ mod tests {
                 logging: None,
                 http: crate::configs::HttpSettings::default(),
                 enabled: true,
+                source_file: "example".to_owned(),
             },
         ];
         assert_eq!(proxied_tls_domains(&sites), vec!["example.com".to_owned()]);

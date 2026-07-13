@@ -15,7 +15,8 @@ KONNECTOR_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/veliuysal/
 ```
 
 Configs: `/opt/konnector/current/configs/`  
-Env file: `/etc/konnector.env`
+Env file: `/etc/konnector.env`  
+Logs: `/etc/konnector/logs/` (`main/`, per-yaml folders, `watchers/`)
 
 ## Install on Windows (Administrator PowerShell)
 
@@ -43,7 +44,7 @@ Install paths:
 - Runtime: `C:\Program Files\Konnector\`
 - Env file: `C:\ProgramData\Konnector\konnector.env`
 - Configs: `C:\ProgramData\Konnector\configs\`
-- Logs: `C:\ProgramData\Konnector\logs\konnector.log`
+- Logs: `C:\ProgramData\Konnector\logs\` (`main\`, per-yaml folders, `watchers\`)
 - Windows service name: `Konnector`
 
 Ports 80/443 require an elevated process or the Windows service.
@@ -102,10 +103,10 @@ konnector restart
 
 ## Automatic HTTPS (Let's Encrypt)
 
-Set the certificate **root folder** in the env file only:
+Certificate **root folder** comes from env (default `/etc/ssl/konnector` on Linux):
 
 ```text
-TLS_DIR=/etc/ssl/konnector
+# TLS_DIR=/etc/ssl/konnector   # optional — this is already the default
 ```
 
 Files used under that folder (never set as paths in YAML):
@@ -127,6 +128,22 @@ tls:
 - `auto: true` — Konnector writes those files into `TLS_DIR`, then serves from them  
 
 DNS must point at the server; port **80** must be reachable for HTTP-01.
+
+## Logs
+
+File logs (override with `LOGS_DIR`):
+
+```text
+/etc/konnector/logs/
+  main/konnector.log          # process / general logs
+  root/access.log             # root.yaml proxy traffic
+  example/access.log          # example.yaml proxy traffic
+  postgres.tcp/access.log     # *.tcp.yaml traffic
+  watchers/config.log         # config watcher
+  watchers/tls.log            # TLS watcher
+```
+
+`konnector logs` shows `logs/main/konnector.log`. Access logs for each YAML live under that file’s named folder; watcher events under `logs/watchers/`.
 
 ## Commands
 
