@@ -31,7 +31,8 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           sed -i "s/^version = .*/version = \"${TAG}\"/" Cargo.toml
-          sed -i "1s/konnector (.*/konnector (${TAG}-1) unstable/" debian/changelog
+          cargo update -p konnector
+          sed -i "1s/(.*) /(${TAG}-1) /" debian/changelog
       - name: Build Debian package
         run: |
           chmod +x debian/rules
@@ -78,6 +79,7 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           sed -i "s/^version = .*/version = \"${TAG}\"/" Cargo.toml
+          cargo update -p konnector
       - name: Build release binary
         run: cargo build --release --locked --bin konnector
       - name: Package Windows zip
