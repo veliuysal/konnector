@@ -181,9 +181,19 @@ fn fetch_cloudflare_origin_certificate(
 }
 
 fn run_fetch_command(command: &str, https: &HttpsConfig) -> Result<(), String> {
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(command)
+    #[cfg(unix)]
+    let mut process = Command::new("sh");
+    #[cfg(unix)]
+    {
+        process.arg("-c").arg(command);
+    }
+    #[cfg(windows)]
+    let mut process = Command::new("cmd");
+    #[cfg(windows)]
+    {
+        process.args(["/C", command]);
+    }
+    let status = process
         .env("TLS_CERT_PATH", &https.certificate_path)
         .env("TLS_KEY_PATH", &https.private_key_path)
         .status()

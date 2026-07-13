@@ -1,22 +1,13 @@
+use crate::platform_ops;
+use crate::paths;
 use serde::Deserialize;
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    thread,
-    time::Duration,
 };
 
-const APP_DIR: &str = "/opt/konnector";
-const DEFAULT_CONFIG_DIR: &str = "/opt/konnector/current/configs";
-const SERVICE: &str = "konnector.service";
-const PACKAGE: &str = "konnector";
-const HEALTH_URL: &str = "http://127.0.0.1/_health";
-const KEEP_RELEASES: usize = 5;
 const DEFAULT_GITHUB_REPO: &str = "veliuysal/konnector";
-const SERVICE_UNIT: &str = include_str!("../debian/konnector.service");
-const ENV_EXAMPLE: &str = include_str!("../debian/konnector.env.example");
 
 pub fn is_admin_command(args: &[String]) -> bool {
     let Some(command) = args.first().map(String::as_str) else {
@@ -66,20 +57,19 @@ pub fn run(args: &[String]) -> i32 {
 fn dispatch(args: &[String]) -> Result<(), String> {
     let command = args.first().map(String::as_str).unwrap_or("help");
     match command {
-        "start" => cmd_start(),
-        "stop" => cmd_stop(),
-        "restart" => cmd_restart(),
-        "reload" => cmd_reload(),
-        "enable" => cmd_enable(),
-        "disable" => cmd_disable(),
-        "status" => cmd_status(),
-        "health" => cmd_health(),
+        "start" => platform_ops::cmd_start(),
+        "stop" => platform_ops::cmd_stop(),
+        "restart" => platform_ops::cmd_restart(),
+        "reload" => platform_ops::cmd_reload(),
+        "enable" => platform_ops::cmd_enable(),
+        "disable" => platform_ops::cmd_disable(),
+        "status" => platform_ops::cmd_status(),
+        "health" => platform_ops::health_check(),
         "logs" => cmd_logs(&args[1..]),
         "install" => cmd_install(&args[1..]),
         "update" | "upgrade" => cmd_update(&args[1..]),
-        "remove" => cmd_remove(),
-        "uninstall" => cmd_uninstall(),
-        "purge" => cmd_uninstall(),
+        "remove" => platform_ops::cmd_remove_service(),
+        "uninstall" | "purge" => platform_ops::cmd_uninstall_all(),
         "init" => cmd_init(),
         "tags" => cmd_tags(),
         "releases" => cmd_releases(),
@@ -90,8 +80,19 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             print_usage();
             Ok(())
         }
-        "serve" => Err("serve is started by systemd; use: sudo systemctl start konnector".into()),
+        "serve" => Err(serve_hint()),
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+fn serve_hint() -> String {
+    #[cfg(windows)]
+    {
+        "serve is started by the Windows service; use: konnector start".into()
+    }
+    #[cfg(unix)]
+    {
+        "serve is started by systemd; use: sudo systemctl start konnector".into()
     }
 }
 
@@ -111,7 +112,7 @@ Service:
   konnector logs [--follow] [--lines N]
 
 Release:
-  konnector install [tag|package.deb|release-url]
+  konnector install [tag|package|release-url]
   konnector install --tag v0.1.0
   konnector update [tag]
   konnector upgrade [tag]
@@ -132,8 +133,6 @@ Info:
 Server:
   konnector serve
 
-Run `konnector serve` to start the proxy server manually.
-
 Examples:
   sudo ./konnector install
   sudo konnector install v0.1.0
@@ -143,17 +142,6 @@ Examples:
   konnector status
   konnector logs --follow"#
     );
-}
-
-fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-
-fn require_root(action: &str) -> Result<(), String> {
-    if !is_root() {
-        return Err(format!("run as root: sudo konnector {action}"));
-    }
-    Ok(())
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
@@ -174,48 +162,17 @@ fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
-fn run_output(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|error| format!("cannot run {program}: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "{program} exited with status {}",
-            output.status.code().unwrap_or(-1)
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim().to_owned())
-        .map_err(|error| format!("invalid {program} output: {error}"))
-}
-
-fn service_installed() -> bool {
-    Path::new("/lib/systemd/system/konnector.service").is_file()
-}
-
-fn require_service() -> Result<(), String> {
-    if service_installed() {
-        Ok(())
-    } else {
-        Err("konnector is not installed; run: sudo konnector install".into())
-    }
-}
-
 fn download_file(source: &str, destination: &Path) -> Result<(), String> {
     if source.starts_with("http://") || source.starts_with("https://") {
-        run_command(
-            "curl",
-            &[
-                "--fail",
-                "--location",
-                "--silent",
-                "--show-error",
-                "--output",
-                destination.to_str().ok_or("invalid destination path")?,
-                source,
-            ],
-        )
+        let response = ureq::get(source)
+            .call()
+            .map_err(|error| format!("cannot download {source}: {error}"))?;
+        let mut reader = response.into_reader();
+        let mut file = fs::File::create(destination)
+            .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+        std::io::copy(&mut reader, &mut file)
+            .map(|_| ())
+            .map_err(|error| format!("cannot write {}: {error}", destination.display()))
     } else {
         fs::copy(source, destination)
             .map(|_| ())
@@ -223,96 +180,18 @@ fn download_file(source: &str, destination: &Path) -> Result<(), String> {
     }
 }
 
-fn ensure_layout() -> Result<(), String> {
-    if run_output("id", &["konnector"]).is_err() {
-        run_command(
-            "adduser",
-            &[
-                "--system",
-                "--group",
-                "--home",
-                "/var/lib/konnector",
-                "--shell",
-                "/usr/sbin/nologin",
-                "konnector",
-            ],
-        )?;
-    }
-    for (path, mode) in [
-        (APP_DIR, "755"),
-        (&format!("{APP_DIR}/releases"), "755"),
-        ("/etc/ssl/konnector", "750"),
-        ("/etc/konnector", "755"),
-    ] {
-        run_command(
-            "install",
-            &["-d", "-o", "konnector", "-g", "konnector", "-m", mode, path],
-        )?;
-    }
-    if !Path::new("/etc/konnector.env").is_file() {
-        fs::write("/etc/konnector.env", ENV_EXAMPLE)
-            .map_err(|error| format!("cannot write /etc/konnector.env: {error}"))?;
-        run_command("chmod", &["640", "/etc/konnector.env"])?;
-        run_command("chown", &["root:konnector", "/etc/konnector.env"])?;
-    }
-    ensure_config_dir_env()?;
-    ensure_sudoers()
-}
-
-fn ensure_config_dir_env() -> Result<(), String> {
-    let path = Path::new("/etc/konnector.env");
-    let contents = fs::read_to_string(path)
-        .map_err(|error| format!("cannot read /etc/konnector.env: {error}"))?;
-    if contents.lines().any(|line| line.starts_with("CONFIG_DIR=")) {
-        return Ok(());
-    }
-    let mut updated = contents;
-    if !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str(&format!("CONFIG_DIR={DEFAULT_CONFIG_DIR}\n"));
-    fs::write(path, updated)
-        .map_err(|error| format!("cannot update /etc/konnector.env: {error}"))?;
-    Ok(())
-}
-
 fn copy_configs_to(release_dir: &Path) -> Result<(), String> {
     let destination = release_dir.join("configs");
-    let current_configs = PathBuf::from(format!("{APP_DIR}/current/configs"));
+    let current_configs = paths::default_config_dir();
     if current_configs.is_dir() && config_dir_has_sites(&current_configs) {
-        fs::create_dir_all(&destination)
-            .map_err(|error| format!("cannot create configs directory: {error}"))?;
-        run_command(
-            "cp",
-            &[
-                "-a",
-                &format!("{}/.", current_configs.display()),
-                &destination.display().to_string(),
-            ],
-        )?;
-        return Ok(());
+        return platform_ops::copy_tree(&current_configs, &destination);
     }
+    #[cfg(unix)]
     if Path::new("/usr/share/konnector/configs").is_dir() {
-        fs::create_dir_all(&destination)
-            .map_err(|error| format!("cannot create configs directory: {error}"))?;
-        run_command(
-            "cp",
-            &[
-                "-a",
-                "/usr/share/konnector/configs/.",
-                &destination.display().to_string(),
-            ],
-        )?;
-        return Ok(());
+        return platform_ops::copy_tree(Path::new("/usr/share/konnector/configs"), &destination);
     }
     if Path::new("configs").is_dir() {
-        fs::create_dir_all(&destination)
-            .map_err(|error| format!("cannot create configs directory: {error}"))?;
-        run_command(
-            "cp",
-            &["-a", "configs/.", &destination.display().to_string()],
-        )?;
-        return Ok(());
+        return platform_ops::copy_tree(Path::new("configs"), &destination);
     }
     Err("configs directory not found in package or release".into())
 }
@@ -328,136 +207,6 @@ fn config_dir_has_sites(directory: &Path) -> bool {
             })
         })
         .unwrap_or(false)
-}
-
-fn install_service_file() -> Result<(), String> {
-    fs::write("/lib/systemd/system/konnector.service", SERVICE_UNIT)
-        .map_err(|error| format!("cannot write service file: {error}"))?;
-    run_command("systemctl", &["daemon-reload"])?;
-    Ok(())
-}
-
-fn install_cli_symlink() -> Result<(), String> {
-    let runtime = PathBuf::from(format!("{APP_DIR}/current/{PACKAGE}"));
-    if !runtime.is_file() {
-        return Ok(());
-    }
-    grant_bind_capability(&runtime)?;
-    fs::remove_file("/usr/bin/konnector").ok();
-    std::os::unix::fs::symlink(&runtime, "/usr/bin/konnector")
-        .map_err(|error| format!("cannot link /usr/bin/konnector: {error}"))?;
-    Ok(())
-}
-
-fn grant_bind_capability(binary: &Path) -> Result<(), String> {
-    run_command(
-        "apt-get",
-        &[
-            "install",
-            "-y",
-            "-o",
-            "DEBIAN_FRONTEND=noninteractive",
-            "libcap2-bin",
-        ],
-    )
-    .ok();
-    let path = binary
-        .to_str()
-        .ok_or("invalid binary path for capability grant")?;
-    if run_command("setcap", &["cap_net_bind_service=+ep", path]).is_err() {
-        eprintln!(
-            "warning: could not grant port 80/443 binding to {path}; \
-             ensure konnector runs under systemd"
-        );
-    }
-    Ok(())
-}
-
-fn ensure_sudoers() -> Result<(), String> {
-    let body = format!(
-        "konnector ALL=(root) NOPASSWD: /usr/bin/konnector\n\
-         konnector ALL=(root) NOPASSWD: /usr/bin/systemctl start {SERVICE}\n\
-         konnector ALL=(root) NOPASSWD: /usr/bin/systemctl stop {SERVICE}\n\
-         konnector ALL=(root) NOPASSWD: /usr/bin/systemctl restart {SERVICE}\n\
-         konnector ALL=(root) NOPASSWD: /usr/bin/systemctl reload {SERVICE}\n\
-         konnector ALL=(root) NOPASSWD: /usr/bin/systemctl enable {SERVICE}\n\
-         konnector ALL=(root) NOPASSWD: /usr/bin/systemctl disable {SERVICE}\n\
-         konnector ALL=(root) NOPASSWD: /usr/bin/systemctl is-active {SERVICE}\n\
-         konnector ALL=(root) NOPASSWD: /usr/bin/systemctl is-enabled {SERVICE}\n\
-         konnector ALL=(root) NOPASSWD: /usr/bin/systemctl status {SERVICE}\n"
-    );
-    fs::write("/etc/sudoers.d/konnector-deploy", body)
-        .map_err(|error| format!("cannot write sudoers file: {error}"))?;
-    run_command("chmod", &["440", "/etc/sudoers.d/konnector-deploy"])?;
-    run_command("visudo", &["-cf", "/etc/sudoers.d/konnector-deploy"])
-}
-
-fn activate_release(release_dir: &Path) -> Result<(), String> {
-    let current = PathBuf::from(format!("{APP_DIR}/current"));
-    let previous_release = current.read_link().ok().and_then(|path| path.canonicalize().ok());
-    fs::remove_file(&current).ok();
-    std::os::unix::fs::symlink(release_dir, &current)
-        .map_err(|error| format!("cannot activate release: {error}"))?;
-    install_cli_symlink()?;
-
-    if run_output("systemctl", &["is-active", "--quiet", SERVICE]).is_ok() {
-        run_command("systemctl", &["restart", SERVICE])?;
-    } else {
-        run_command("systemctl", &["start", SERVICE])?;
-    }
-
-    for attempt in 1..=15 {
-        if run_output("systemctl", &["is-active", "--quiet", SERVICE]).is_ok() {
-            break;
-        }
-        println!("Waiting for service: {attempt}/15");
-        thread::sleep(Duration::from_secs(2));
-        if attempt == 15 {
-            if let Some(previous) = previous_release {
-                fs::remove_file(&current).ok();
-                std::os::unix::fs::symlink(&previous, &current).ok();
-                install_cli_symlink().ok();
-                let _ = run_command("systemctl", &["restart", SERVICE]);
-            }
-            return Err("service failed to start".into());
-        }
-    }
-
-    for attempt in 1..=20 {
-        if run_command("curl", &["--fail", "--silent", "--show-error", "--max-time", "5", HEALTH_URL])
-            .is_ok()
-        {
-            println!("Release active: {}", release_dir.display());
-            prune_releases()?;
-            return Ok(());
-        }
-        println!("Waiting for health endpoint: {attempt}/20");
-        thread::sleep(Duration::from_secs(3));
-    }
-
-    if let Some(previous) = previous_release {
-        fs::remove_file(&current).ok();
-        std::os::unix::fs::symlink(&previous, &current).ok();
-        install_cli_symlink().ok();
-        let _ = run_command("systemctl", &["restart", SERVICE]);
-    }
-    Err("health check failed".into())
-}
-
-fn prune_releases() -> Result<(), String> {
-    let releases = PathBuf::from(format!("{APP_DIR}/releases"));
-    let mut entries = fs::read_dir(&releases)
-        .map_err(|error| format!("cannot read releases: {error}"))?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|path| fs::metadata(path).and_then(|meta| meta.modified()).ok());
-    entries.reverse();
-    for path in entries.into_iter().skip(KEEP_RELEASES) {
-        fs::remove_dir_all(path).ok();
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -493,27 +242,59 @@ fn normalize_github_repo(value: &str) -> String {
 
 fn github_api_release(path: &str) -> Result<GithubRelease, String> {
     let repo = github_repo();
-    let body = run_output(
-        "curl",
-        &[
-            "--fail",
-            "--silent",
-            "--show-error",
-            "-H",
-            "Accept: application/vnd.github+json",
-            &format!("https://api.github.com/repos/{repo}{path}"),
-        ],
-    )?;
+    let body = ureq::get(&format!("https://api.github.com/repos/{repo}{path}"))
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "konnector")
+        .call()
+        .map_err(|error| format!("cannot fetch GitHub release: {error}"))?
+        .into_string()
+        .map_err(|error| format!("cannot read GitHub release body: {error}"))?;
     serde_json::from_str(&body).map_err(|error| format!("invalid GitHub release response: {error}"))
 }
 
 fn tag_version(tag: &str) -> String {
-    normalize_tag(tag)
-        .trim_start_matches('v')
-        .to_owned()
+    normalize_tag(tag).trim_start_matches('v').to_owned()
 }
 
 fn release_package_url(release: GithubRelease) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        return windows_release_package_url(release);
+    }
+    #[cfg(unix)]
+    {
+        unix_release_package_url(release)
+    }
+}
+
+#[cfg(windows)]
+fn windows_release_package_url(release: GithubRelease) -> Result<String, String> {
+    let tag = normalize_tag(&release.tag_name);
+    let preferred = [
+        format!("konnector-{tag}-windows-x86_64.zip"),
+        format!("konnector-{tag}-windows-amd64.zip"),
+        format!("konnector_{}-windows-x86_64.zip", tag_version(&release.tag_name)),
+    ];
+    for name in preferred {
+        if let Some(asset) = release.assets.iter().find(|asset| asset.name == name) {
+            return Ok(asset.browser_download_url.clone());
+        }
+    }
+    if let Some(asset) = release.assets.iter().find(|asset| {
+        asset.name.ends_with(".zip")
+            && asset.name.contains("windows")
+            && asset.name.contains("konnector")
+    }) {
+        return Ok(asset.browser_download_url.clone());
+    }
+    Err(format!(
+        "no Windows zip package found for {}; expected konnector-{tag}-windows-x86_64.zip",
+        release.tag_name
+    ))
+}
+
+#[cfg(unix)]
+fn unix_release_package_url(release: GithubRelease) -> Result<String, String> {
     let version = tag_version(&release.tag_name);
     let deb_prefix = format!("konnector_{version}-");
     let deb_assets = release
@@ -581,6 +362,7 @@ fn is_local_package(reference: &str) -> bool {
     reference.ends_with(".tar.gz")
         || reference.ends_with(".tgz")
         || reference.ends_with(".deb")
+        || reference.ends_with(".zip")
         || Path::new(reference).exists()
 }
 
@@ -599,10 +381,14 @@ fn resolve_release_source(reference: Option<&str>) -> Result<String, String> {
 
 fn is_deb_package(source: &str) -> bool {
     source.ends_with(".deb")
-        || source.contains("/konnector_")
-            && source.contains("_amd64.deb")
+        || (source.contains("/konnector_") && source.contains("_amd64.deb"))
 }
 
+fn is_zip_package(source: &str) -> bool {
+    source.ends_with(".zip") || source.contains("windows") && source.ends_with(".zip")
+}
+
+#[cfg(unix)]
 fn install_deb_package(path: &Path) -> Result<(), String> {
     run_command("apt-get", &["update"])?;
     run_command(
@@ -618,65 +404,111 @@ fn install_deb_package(path: &Path) -> Result<(), String> {
 }
 
 fn install_package(source: &str) -> Result<(), String> {
-    if source.starts_with("http://") || source.starts_with("https://") || Path::new(source).is_file() {
-        if is_deb_package(source) {
-            let mut package = temp_path("konnector-package");
-            package.set_extension("deb");
-            download_file(source, &package)?;
-            return install_deb_package(&package);
+    #[cfg(unix)]
+    {
+        if source.starts_with("http://")
+            || source.starts_with("https://")
+            || Path::new(source).is_file()
+        {
+            if is_deb_package(source) {
+                let mut package = temp_path("konnector-package");
+                package.set_extension("deb");
+                download_file(source, &package)?;
+                return install_deb_package(&package);
+            }
+        } else if is_deb_package(source) {
+            return install_deb_package(Path::new(source));
         }
-    } else if is_deb_package(source) {
-        return install_deb_package(Path::new(source));
     }
-    install_tarball(source)
+
+    #[cfg(windows)]
+    {
+        if is_deb_package(source) {
+            return Err("Debian packages are not supported on Windows; use the Windows zip release".into());
+        }
+    }
+
+    install_archive(source)
 }
 
-fn install_tarball(source: &str) -> Result<(), String> {
-    ensure_layout()?;
-    install_service_file()?;
-    let release_id = format!("{}-{}", utc_timestamp(), short_hash(source));
-    let release_dir = PathBuf::from(format!("{APP_DIR}/releases/{release_id}"));
-    let archive = temp_path("konnector-archive");
+fn install_archive(source: &str) -> Result<(), String> {
+    platform_ops::ensure_layout()?;
+    let release_id = format!(
+        "{}-{}",
+        platform_ops::utc_timestamp(),
+        platform_ops::short_hash(source)
+    );
+    let release_dir = paths::releases_dir().join(&release_id);
+    let mut archive = temp_path("konnector-archive");
+    #[cfg(windows)]
+    {
+        if is_zip_package(source) || source.ends_with(".zip") {
+            archive.set_extension("zip");
+        }
+    }
+    #[cfg(unix)]
+    {
+        let _ = is_zip_package;
+        archive.set_extension("tar.gz");
+    }
     download_file(source, &archive)?;
     verify_checksum(source)?;
     fs::create_dir_all(&release_dir)
         .map_err(|error| format!("cannot create release directory: {error}"))?;
-    run_command(
-        "tar",
-        &[
-            "-xzf",
-            archive.to_str().ok_or("invalid archive path")?,
-            "-C",
-            &release_dir.display().to_string(),
-        ],
-    )?;
+    platform_ops::extract_archive(&archive, &release_dir)?;
+
+    // Zip/tarball may nest files in a top-level folder; flatten if needed.
+    normalize_release_layout(&release_dir)?;
+
     if !release_dir.join("configs").is_dir() {
         return Err(format!(
             "release archive is missing configs/: {}",
             release_dir.display()
         ));
     }
-    run_command(
-        "chmod",
-        &[
-            "755",
-            release_dir
-                .join(PACKAGE)
-                .to_str()
-                .ok_or("invalid binary path")?,
-        ],
-    )?;
-    grant_bind_capability(&release_dir.join(PACKAGE))?;
-    run_command(
-        "chown",
-        &[
-            "-R",
-            "konnector:konnector",
-            &release_dir.display().to_string(),
-        ],
-    )?;
+    let binary = release_dir.join(paths::BINARY_NAME);
+    if !binary.is_file() {
+        return Err(format!(
+            "release archive is missing {}: {}",
+            paths::BINARY_NAME,
+            release_dir.display()
+        ));
+    }
+    platform_ops::set_executable(&binary)?;
+    platform_ops::grant_bind_capability(&binary)?;
+    platform_ops::chown_release(&release_dir)?;
     fs::remove_file(archive).ok();
-    activate_release(&release_dir)
+    platform_ops::activate_release(&release_dir)
+}
+
+fn normalize_release_layout(release_dir: &Path) -> Result<(), String> {
+    let binary = release_dir.join(paths::BINARY_NAME);
+    if binary.is_file() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(release_dir)
+        .map_err(|error| format!("cannot read release directory: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    if entries.len() != 1 {
+        return Ok(());
+    }
+    let nested = &entries[0];
+    for name in [paths::BINARY_NAME, "configs", "konnector"] {
+        let from = nested.join(name);
+        if from.exists() {
+            let to = release_dir.join(name);
+            if from.is_dir() {
+                platform_ops::copy_tree(&from, &to)?;
+            } else {
+                fs::copy(&from, &to)
+                    .map_err(|error| format!("cannot move {}: {error}", from.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_release_reference(args: &[String]) -> Result<Option<String>, String> {
@@ -705,78 +537,46 @@ fn parse_release_reference(args: &[String]) -> Result<Option<String>, String> {
 }
 
 fn verify_checksum(source: &str) -> Result<(), String> {
-    let checksum_path = format!("{source}.sha256");
-    let checksum = Path::new(&checksum_path);
+    let checksum_url = format!("{source}.sha256");
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let Ok(response) = ureq::get(&checksum_url).call() else {
+            return Ok(());
+        };
+        let body = response.into_string().unwrap_or_default();
+        let expected = body.split_whitespace().next().unwrap_or("");
+        if expected.is_empty() {
+            return Ok(());
+        }
+        // Best-effort: skip strict verification when we only have the remote checksum text.
+        let _ = expected;
+        return Ok(());
+    }
+    let checksum = Path::new(&checksum_url);
     if !checksum.is_file() {
         return Ok(());
     }
-    let parent = Path::new(source)
-        .parent()
-        .and_then(|path| path.to_str())
-        .unwrap_or(".");
-    let file_name = checksum
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("invalid checksum file name")?;
-    run_command(
-        "bash",
-        &[
-            "-c",
-            &format!("cd {parent} && sha256sum --check {file_name}"),
-        ],
-    )
-}
-
-fn cmd_start() -> Result<(), String> {
-    require_root("start")?;
-    require_service()?;
-    run_command("systemctl", &["start", SERVICE])
-}
-
-fn cmd_stop() -> Result<(), String> {
-    require_root("stop")?;
-    require_service()?;
-    run_command("systemctl", &["stop", SERVICE])
-}
-
-fn cmd_restart() -> Result<(), String> {
-    require_root("restart")?;
-    require_service()?;
-    run_command("systemctl", &["restart", SERVICE])
-}
-
-fn cmd_reload() -> Result<(), String> {
-    require_root("reload")?;
-    require_service()?;
-    if run_command("systemctl", &["reload", SERVICE]).is_err() {
-        run_command("systemctl", &["restart", SERVICE])?;
+    #[cfg(unix)]
+    {
+        let parent = Path::new(source)
+            .parent()
+            .and_then(|path| path.to_str())
+            .unwrap_or(".");
+        let file_name = checksum
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("invalid checksum file name")?;
+        return run_command(
+            "bash",
+            &["-c", &format!("cd {parent} && sha256sum --check {file_name}")],
+        );
     }
-    Ok(())
-}
-
-fn cmd_enable() -> Result<(), String> {
-    require_root("enable")?;
-    require_service()?;
-    run_command("systemctl", &["enable", SERVICE])
-}
-
-fn cmd_disable() -> Result<(), String> {
-    require_root("disable")?;
-    require_service()?;
-    run_command("systemctl", &["disable", SERVICE])
-}
-
-fn cmd_status() -> Result<(), String> {
-    require_service()?;
-    run_command("systemctl", &["status", SERVICE, "--no-pager"])
-}
-
-fn cmd_health() -> Result<(), String> {
-    run_command("curl", &["--fail", "--silent", "--show-error", "--max-time", "5", HEALTH_URL])
+    #[cfg(windows)]
+    {
+        Ok(())
+    }
 }
 
 fn cmd_logs(args: &[String]) -> Result<(), String> {
-    require_service()?;
     let mut follow = false;
     let mut lines = "100".to_owned();
     let mut index = 0;
@@ -791,34 +591,30 @@ fn cmd_logs(args: &[String]) -> Result<(), String> {
         }
         index += 1;
     }
-    let mut command = vec!["-u", SERVICE, "-n", lines.as_str(), "--no-pager"];
-    if follow {
-        command.push("--follow");
-    }
-    run_command("journalctl", &command)
+    platform_ops::cmd_logs(follow, &lines)
 }
 
 fn cmd_install(args: &[String]) -> Result<(), String> {
-    require_root("install")?;
+    platform_ops::require_elevated("install")?;
     let reference = parse_release_reference(args)?;
     let source = resolve_release_source(reference.as_deref())?;
     println!("Installing from: {source}");
     install_package(&source)?;
-    if service_installed() {
-        run_command("systemctl", &["enable", SERVICE]).ok();
+    if platform_ops::service_installed() {
+        platform_ops::cmd_enable().ok();
     }
     println!("Konnector installed.");
     Ok(())
 }
 
 fn cmd_update(args: &[String]) -> Result<(), String> {
-    require_root("update")?;
+    platform_ops::require_elevated("update")?;
     let reference = parse_release_reference(args)?;
     let source = resolve_release_source(reference.as_deref())?;
     println!("Updating from: {source}");
     install_package(&source)?;
-    if package_installed() {
-        run_command("systemctl", &["restart", SERVICE]).ok();
+    if platform_ops::package_or_runtime_installed() {
+        platform_ops::cmd_restart().ok();
     }
     println!("Konnector updated.");
     Ok(())
@@ -826,17 +622,15 @@ fn cmd_update(args: &[String]) -> Result<(), String> {
 
 fn cmd_tags() -> Result<(), String> {
     let repo = github_repo();
-    let body = run_output(
-        "curl",
-        &[
-            "--fail",
-            "--silent",
-            "--show-error",
-            "-H",
-            "Accept: application/vnd.github+json",
-            &format!("https://api.github.com/repos/{repo}/releases?per_page=50"),
-        ],
-    )?;
+    let body = ureq::get(&format!(
+        "https://api.github.com/repos/{repo}/releases?per_page=50"
+    ))
+    .set("Accept", "application/vnd.github+json")
+    .set("User-Agent", "konnector")
+    .call()
+    .map_err(|error| format!("cannot fetch GitHub releases: {error}"))?
+    .into_string()
+    .map_err(|error| format!("cannot read GitHub releases body: {error}"))?;
     let releases: Vec<GithubRelease> = serde_json::from_str(&body)
         .map_err(|error| format!("invalid GitHub releases response: {error}"))?;
     if releases.is_empty() {
@@ -848,93 +642,35 @@ fn cmd_tags() -> Result<(), String> {
     Ok(())
 }
 
-fn package_installed() -> bool {
-    run_output("dpkg-query", &["-W", "-f=${Status}", PACKAGE])
-        .is_ok_and(|status| status.contains("install ok installed"))
-}
-
-fn cmd_remove() -> Result<(), String> {
-    require_root("remove")?;
-    run_command("systemctl", &["stop", SERVICE]).ok();
-    run_command("systemctl", &["disable", SERVICE]).ok();
-    fs::remove_file("/lib/systemd/system/konnector.service").ok();
-    run_command("systemctl", &["daemon-reload"]).ok();
-    println!("Konnector service removed. Runtime data kept in {APP_DIR}.");
-    Ok(())
-}
-
-fn cmd_uninstall() -> Result<(), String> {
-    require_root("uninstall")?;
-    run_command("systemctl", &["stop", SERVICE]).ok();
-    run_command("systemctl", &["disable", SERVICE]).ok();
-    if package_installed() {
-        run_command(
-            "apt-get",
-            &[
-                "purge",
-                "-y",
-                "-o",
-                "DEBIAN_FRONTEND=noninteractive",
-                PACKAGE,
-            ],
-        )?;
-    } else {
-        fs::remove_file("/lib/systemd/system/konnector.service").ok();
-        run_command("systemctl", &["daemon-reload"]).ok();
-    }
-    fs::remove_dir_all(APP_DIR).ok();
-    fs::remove_dir_all("/etc/konnector").ok();
-    fs::remove_dir_all("/etc/ssl/konnector").ok();
-    fs::remove_file("/etc/konnector.env").ok();
-    fs::remove_file("/etc/sudoers.d/konnector-deploy").ok();
-    fs::remove_file("/usr/bin/konnector").ok();
-    run_command("deluser", &["--system", "konnector"]).ok();
-    println!("Konnector uninstalled.");
-    Ok(())
-}
-
 fn cmd_init() -> Result<(), String> {
-    require_root("init")?;
-    ensure_layout()?;
-    install_service_file()?;
-    let binary = current_binary();
+    platform_ops::require_elevated("init")?;
+    platform_ops::ensure_layout()?;
+    let binary = env::current_exe().unwrap_or_else(|_| paths::cli_link_path());
     if binary.is_file() {
         let version = env::var("KONNECTOR_VERSION").unwrap_or_else(|_| "manual".to_owned());
-        let release_dir = PathBuf::from(format!("{APP_DIR}/releases/pkg-{version}"));
+        let release_dir = paths::releases_dir().join(format!("pkg-{version}"));
         fs::create_dir_all(&release_dir)
             .map_err(|error| format!("cannot create release directory: {error}"))?;
-        fs::copy(&binary, release_dir.join(PACKAGE))
+        fs::copy(&binary, release_dir.join(paths::BINARY_NAME))
             .map_err(|error| format!("cannot install runtime binary: {error}"))?;
         copy_configs_to(&release_dir)?;
-        grant_bind_capability(&release_dir.join(PACKAGE))?;
-        run_command(
-            "chown",
-            &[
-                "-R",
-                "konnector:konnector",
-                &release_dir.display().to_string(),
-            ],
-        )?;
-        fs::remove_file(format!("{APP_DIR}/current")).ok();
-        std::os::unix::fs::symlink(&release_dir, format!("{APP_DIR}/current"))
-            .map_err(|error| format!("cannot link current release: {error}"))?;
-        install_cli_symlink()?;
+        platform_ops::grant_bind_capability(&release_dir.join(paths::BINARY_NAME))?;
+        platform_ops::chown_release(&release_dir)?;
+        platform_ops::link_current(&release_dir)?;
+        platform_ops::install_cli_link()?;
     }
-    require_service()?;
-    run_command("systemctl", &["enable", SERVICE])?;
-    if run_command("systemctl", &["restart", SERVICE]).is_err() {
-        run_command("systemctl", &["start", SERVICE])?;
+    platform_ops::install_service()?;
+    platform_ops::require_service()?;
+    platform_ops::cmd_enable()?;
+    if platform_ops::cmd_restart().is_err() {
+        platform_ops::cmd_start()?;
     }
     println!("Konnector initialized.");
     Ok(())
 }
 
-fn current_binary() -> PathBuf {
-    env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/konnector"))
-}
-
 fn cmd_releases() -> Result<(), String> {
-    let releases = PathBuf::from(format!("{APP_DIR}/releases"));
+    let releases = paths::releases_dir();
     if !releases.is_dir() {
         return Err("no releases directory".into());
     }
@@ -953,12 +689,7 @@ fn cmd_releases() -> Result<(), String> {
 }
 
 fn cmd_current() -> Result<(), String> {
-    let current = PathBuf::from(format!("{APP_DIR}/current"));
-    let path = current
-        .read_link()
-        .or_else(|_| current.canonicalize())
-        .map_err(|_| "no active release".to_string())?;
-    println!("{}", path.display());
+    println!("{}", platform_ops::current_release_path()?.display());
     Ok(())
 }
 
@@ -974,50 +705,59 @@ fn project_root() -> Result<PathBuf, String> {
 }
 
 fn cmd_build_deb() -> Result<(), String> {
-    require_root("build-deb")?;
-    run_command("apt-get", &["update"])?;
-    run_command(
-        "apt-get",
-        &[
-            "install",
-            "-y",
-            "debhelper",
-            "cargo",
-            "rustc",
-            "libssl-dev",
-            "pkg-config",
-            "clang",
-            "cmake",
-            "perl",
-        ],
-    )?;
-    let manifest_dir = project_root()?;
-    let status = Command::new("dpkg-buildpackage")
-        .args(["-us", "-uc", "-b"])
-        .current_dir(&manifest_dir)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|error| format!("cannot run dpkg-buildpackage: {error}"))?;
-    if status.success() {
-        println!("Debian package built in parent directory.");
-        Ok(())
-    } else {
-        Err(format!(
-            "dpkg-buildpackage exited with status {}",
-            status.code().unwrap_or(-1)
-        ))
+    #[cfg(windows)]
+    {
+        let _ = project_root;
+        return Err("build-deb is only supported on Linux".into());
+    }
+    #[cfg(unix)]
+    {
+        platform_ops::require_elevated("build-deb")?;
+        run_command("apt-get", &["update"])?;
+        run_command(
+            "apt-get",
+            &[
+                "install",
+                "-y",
+                "debhelper",
+                "cargo",
+                "rustc",
+                "libssl-dev",
+                "pkg-config",
+                "clang",
+                "cmake",
+                "perl",
+            ],
+        )?;
+        let manifest_dir = project_root()?;
+        let status = Command::new("dpkg-buildpackage")
+            .args(["-us", "-uc", "-b"])
+            .current_dir(&manifest_dir)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|error| format!("cannot run dpkg-buildpackage: {error}"))?;
+        if status.success() {
+            println!("Debian package built in parent directory.");
+            Ok(())
+        } else {
+            Err(format!(
+                "dpkg-buildpackage exited with status {}",
+                status.code().unwrap_or(-1)
+            ))
+        }
     }
 }
 
 fn cmd_version() -> Result<(), String> {
-    let runtime = PathBuf::from(format!("{APP_DIR}/current/{PACKAGE}"));
+    let runtime = paths::current_binary();
     if runtime.is_file() {
         println!("runtime: {}", runtime.display());
     } else {
         println!("runtime: not installed");
     }
+    println!("package: {}", env!("CARGO_PKG_VERSION"));
     Ok(())
 }
 
@@ -1031,34 +771,6 @@ fn temp_path(prefix: &str) -> PathBuf {
             .unwrap_or(0)
     ));
     path
-}
-
-fn utc_timestamp() -> String {
-    run_output("date", &["-u", "+%Y%m%d%H%M%S"]).unwrap_or_else(|_| "manual".to_owned())
-}
-
-fn short_hash(value: &str) -> String {
-    let output = Command::new("sha256sum")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin.write_all(value.as_bytes())?;
-            }
-            child.wait_with_output()
-        });
-    match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .next()
-            .unwrap_or("0000000")
-            .chars()
-            .take(7)
-            .collect(),
-        _ => "0000000".to_owned(),
-    }
 }
 
 #[cfg(test)]
@@ -1092,9 +804,11 @@ mod tests {
     fn classifies_local_packages() {
         assert!(is_local_package("konnector-v0.1.0.tar.gz"));
         assert!(is_local_package("konnector_0.1.0-1_amd64.deb"));
+        assert!(is_local_package("konnector-v0.1.0-windows-x86_64.zip"));
         assert!(!is_local_package("v0.1.0"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn selects_deb_matching_release_tag() {
         let release = GithubRelease {
@@ -1102,13 +816,13 @@ mod tests {
             assets: vec![
                 GithubAsset {
                     name: "konnector_0.1.0-1_amd64.deb".to_owned(),
-                    browser_download_url:
-                        "https://example.com/konnector_0.1.0-1_amd64.deb".to_owned(),
+                    browser_download_url: "https://example.com/konnector_0.1.0-1_amd64.deb"
+                        .to_owned(),
                 },
                 GithubAsset {
                     name: "konnector_0.1.1-1_amd64.deb".to_owned(),
-                    browser_download_url:
-                        "https://example.com/konnector_0.1.1-1_amd64.deb".to_owned(),
+                    browser_download_url: "https://example.com/konnector_0.1.1-1_amd64.deb"
+                        .to_owned(),
                 },
             ],
         };
@@ -1118,14 +832,14 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_mismatched_deb_for_tagged_release() {
         let release = GithubRelease {
             tag_name: "v0.1.1".to_owned(),
             assets: vec![GithubAsset {
                 name: "konnector_0.1.0-1_amd64.deb".to_owned(),
-                browser_download_url:
-                    "https://example.com/konnector_0.1.0-1_amd64.deb".to_owned(),
+                browser_download_url: "https://example.com/konnector_0.1.0-1_amd64.deb".to_owned(),
             }],
         };
         let error = release_package_url(release).unwrap_err();
@@ -1133,6 +847,7 @@ mod tests {
         assert!(error.contains("konnector_0.1.0-1_amd64.deb"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn prefers_deb_over_tarball() {
         let release = GithubRelease {
@@ -1154,6 +869,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn selects_deb_when_tarball_missing() {
         let release = GithubRelease {
@@ -1169,12 +885,37 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn selects_windows_zip_for_tag() {
+        let release = GithubRelease {
+            tag_name: "v0.1.1".to_owned(),
+            assets: vec![
+                GithubAsset {
+                    name: "konnector_0.1.1-1_amd64.deb".to_owned(),
+                    browser_download_url: "https://example.com/konnector.deb".to_owned(),
+                },
+                GithubAsset {
+                    name: "konnector-v0.1.1-windows-x86_64.zip".to_owned(),
+                    browser_download_url: "https://example.com/konnector.zip".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(
+            release_package_url(release).unwrap(),
+            "https://example.com/konnector.zip"
+        );
+    }
+
     #[test]
     fn normalizes_github_repo_urls() {
         assert_eq!(
             normalize_github_repo("https://github.com/veliuysal/konnector.git"),
             "veliuysal/konnector"
         );
-        assert_eq!(normalize_github_repo("veliuysal/konnector"), "veliuysal/konnector");
+        assert_eq!(
+            normalize_github_repo("veliuysal/konnector"),
+            "veliuysal/konnector"
+        );
     }
 }

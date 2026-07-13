@@ -13,8 +13,8 @@ env:
   BINARY_NAME: konnector
 
 jobs:
-  release:
-    name: Build package and publish release
+  linux:
+    name: Build Linux package
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -51,7 +51,7 @@ jobs:
           test -f "konnector-${{ github.ref_name }}.tar.gz"
           test -f "konnector-${{ github.ref_name }}.tar.gz.sha256"
           ls -la ../*.deb konnector-${{ github.ref_name }}.tar.gz*
-      - name: Publish GitHub release
+      - name: Publish GitHub release (Linux)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
@@ -61,4 +61,42 @@ jobs:
             ../konnector_*_amd64.deb
             konnector-${{ github.ref_name }}.tar.gz
             konnector-${{ github.ref_name }}.tar.gz.sha256
+          generate_release_notes: true
+
+  windows:
+    name: Build Windows package
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo files
+        uses: Swatinem/rust-cache@v2
+      - name: Set package version from tag
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = .*/version = \"${TAG}\"/" Cargo.toml
+      - name: Build release binary
+        run: cargo build --release --locked --bin konnector
+      - name: Package Windows zip
+        shell: bash
+        run: |
+          mkdir -p artifact
+          cp target/release/konnector.exe artifact/konnector.exe
+          cp -R configs artifact/configs
+          cp windows/konnector.env.example artifact/konnector.env.example
+          powershell -NoProfile -Command "Compress-Archive -Path artifact\\* -DestinationPath konnector-${{ github.ref_name }}-windows-x86_64.zip -Force"
+          powershell -NoProfile -Command "(Get-FileHash konnector-${{ github.ref_name }}-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower() + '  konnector-${{ github.ref_name }}-windows-x86_64.zip'" > konnector-${{ github.ref_name }}-windows-x86_64.zip.sha256
+          ls -la konnector-${{ github.ref_name }}-windows-x86_64.zip*
+      - name: Publish GitHub release (Windows)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            konnector-${{ github.ref_name }}-windows-x86_64.zip
+            konnector-${{ github.ref_name }}-windows-x86_64.zip.sha256
           generate_release_notes: true

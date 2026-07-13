@@ -6,12 +6,15 @@ mod config_watcher;
 mod configs;
 mod default_site;
 mod domain_routing;
+mod env_file;
 mod error_pages;
 mod forwarding;
 mod health_check;
 mod http3;
 mod internal_routes;
 mod path_rewrite;
+mod paths;
+mod platform_ops;
 mod proxy;
 mod redirects;
 mod request_logging;
@@ -21,8 +24,19 @@ mod tcp_proxy;
 mod upstreams;
 mod validation;
 
+#[cfg(windows)]
+mod windows_svc;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    #[cfg(windows)]
+    if args.is_empty() && windows_svc::try_start_dispatcher() {
+        return;
+    }
+
+    env_file::load_if_present(&paths::env_file());
+
     if should_run_server(&args) {
         application::run();
         return;

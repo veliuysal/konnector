@@ -358,7 +358,7 @@ pub fn config_dir() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
-    let production = PathBuf::from("/opt/konnector/current/configs");
+    let production = crate::paths::production_config_dir();
     if production.is_dir() {
         return production;
     }

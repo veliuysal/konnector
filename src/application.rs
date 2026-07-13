@@ -67,14 +67,33 @@ pub fn run() {
 
 fn init_logging() {
     use env_logger::{Builder, Env};
-    Builder::from_env(Env::default().default_filter_or("info"))
+    use std::io::Write;
+
+    let mut builder = Builder::from_env(Env::default().default_filter_or("info"));
+    builder
         .filter_module("pingora", log::LevelFilter::Off)
         .filter_module("pingora_proxy", log::LevelFilter::Off)
         .filter_module("pingora_core", log::LevelFilter::Off)
         .filter_module("pingora_cache", log::LevelFilter::Off)
-        .filter_module("pingora_load_balancing", log::LevelFilter::Off)
+        .filter_module("pingora_load_balancing", log::LevelFilter::Off);
+
+    #[cfg(windows)]
+    {
+        use env_logger::Target;
+        use std::fs::OpenOptions;
+        if std::env::var_os("KONNECTOR_SERVICE").is_some() {
+            let log_path = crate::paths::log_file();
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+                builder.target(Target::Pipe(Box::new(file)));
+            }
+        }
+    }
+
+    builder
         .format(|buf, record| {
-            use std::io::Write;
             writeln!(
                 buf,
                 "[{} konnector] {}",
@@ -90,30 +109,65 @@ fn assert_port_available(addr: &str) {
         Ok(listener) => drop(listener),
         Err(error) => {
             let port = addr.rsplit_once(':').map(|(_, port)| port).unwrap_or("80");
-            let hint = if error.raw_os_error() == Some(13) {
-                "Permission denied binding to a privileged port.\n\
-                 Do not start the proxy with bare `konnector`. Use:\n\
-                   sudo systemctl start konnector\n\
-                   konnector status\n\
-                 Or grant the capability:\n\
-                   sudo apt install -y libcap2-bin\n\
-                   sudo setcap cap_net_bind_service=+ep /opt/konnector/current/konnector"
-            } else if error.raw_os_error() == Some(98) {
-                "Port {port} is already in use. Konnector may already be running.\n\
-                 Use CLI commands instead of starting a second instance:\n\
-                   konnector status\n\
-                   konnector health\n\
-                   sudo systemctl restart konnector"
-            } else {
-                "Check which process owns the port:\n\
-                   sudo ss -tlnp | grep ':{port} '"
-            };
+            let hint = bind_error_hint(port, error.raw_os_error());
             eprintln!(
-                "Cannot bind {addr}: {error}\n{hint}\n\
-                 Then check the port is free:\n\
-                   sudo ss -tlnp | grep ':{port} '",
+                "Cannot bind {addr}: {error}\n{hint}"
             );
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(unix)]
+fn bind_error_hint(port: &str, code: Option<i32>) -> String {
+    if code == Some(13) {
+        "Permission denied binding to a privileged port.\n\
+         Do not start the proxy with bare `konnector`. Use:\n\
+           sudo systemctl start konnector\n\
+           konnector status\n\
+         Or grant the capability:\n\
+           sudo apt install -y libcap2-bin\n\
+           sudo setcap cap_net_bind_service=+ep /opt/konnector/current/konnector"
+            .into()
+    } else if code == Some(98) {
+        format!(
+            "Port {port} is already in use. Konnector may already be running.\n\
+             Use CLI commands instead of starting a second instance:\n\
+               konnector status\n\
+               konnector health\n\
+               sudo systemctl restart konnector"
+        )
+    } else {
+        format!(
+            "Check which process owns the port:\n\
+               sudo ss -tlnp | grep ':{port} '"
+        )
+    }
+}
+
+#[cfg(windows)]
+fn bind_error_hint(port: &str, code: Option<i32>) -> String {
+    // WSAEACCES = 10013, WSAEADDRINUSE = 10048
+    if code == Some(10013) || code == Some(5) {
+        format!(
+            "Access denied binding to port {port}.\n\
+             Run an elevated shell, or start the Windows service:\n\
+               konnector start\n\
+               konnector status\n\
+             Privileged ports (<1024) require Administrator on Windows."
+        )
+    } else if code == Some(10048) {
+        format!(
+            "Port {port} is already in use. Konnector may already be running.\n\
+             Use:\n\
+               konnector status\n\
+               konnector health\n\
+               konnector restart"
+        )
+    } else {
+        format!(
+            "Check which process owns the port:\n\
+               netstat -ano | findstr :{port}"
+        )
     }
 }
