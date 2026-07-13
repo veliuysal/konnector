@@ -106,12 +106,12 @@ Exact hostnames win over wildcards when both could match.
 
 ### Listeners (http / https)
 
-Sites default to the **HTTP** listener only. Enable HTTPS (or both) with `listen`:
+Sites default to **both** HTTP and HTTPS. Restrict with `listen` if needed:
 
 ```yaml
-listen: https   # TLS only (also: 443)
-listen: both    # HTTP + HTTPS
-# listen: http  # default (also: 80)
+# listen: both   # default — required for Cloudflare Full/Strict to origin :443
+listen: https    # TLS only (also: 443)
+listen: http     # plain HTTP only (also: 80)
 ```
 
 Same hostname can be split across two YAMLs (one `listen: http`, one `listen: https`).
@@ -124,6 +124,18 @@ redirect_https: true
 ```
 
 ACME HTTP-01 challenges are answered before this redirect.
+
+### Cloudflare Origin CA (optional)
+
+Behind orange-cloud with **Full (strict)**, set a token so Origin CA is used instead of Let's Encrypt:
+
+```text
+CLOUDFLARE_API_TOKEN=...   # Origin CA Create Certificate permission
+```
+
+No other TLS settings are required. On start Konnector fetches the Origin cert; the watcher renews when needed.
+
+Site YAML tip: `forwarding: cloudflare` trusts CF headers.
 
 ### WebSocket (ws / wss)
 
@@ -179,33 +191,31 @@ sudo konnector restart
 konnector restart
 ```
 
-## Automatic HTTPS (Let's Encrypt)
+## Automatic HTTPS
 
-Certificate **root folder** comes from env (default `/etc/ssl/konnector` on Linux):
+HTTPS is **on by default**. The server picks the certificate source automatically — you do not set a provider:
+
+- `CLOUDFLARE_API_TOKEN` set → Cloudflare Origin CA  
+- otherwise → Let's Encrypt (ACME)
+
+Just enable a site with real domains and restart. Certs are issued/renewed into `TLS_DIR` (default `/etc/ssl/konnector`).
+
+Optional:
 
 ```text
-# TLS_DIR=/etc/ssl/konnector   # optional — this is already the default
+# TLS_ENABLED=false          # turn HTTPS off
+# CLOUDFLARE_API_TOKEN=...   # prefer Origin CA (behind Cloudflare Full strict)
+# ACME_STAGING=true          # Let's Encrypt staging
 ```
 
-Files used under that folder (never set as paths in YAML):
+For Let's Encrypt, DNS must point here and port **80** must be reachable (HTTP-01). Wildcards need Cloudflare Origin CA.
 
-- `fullchain.pem` — certificate chain (server always loads this)
-- `privkey.pem` — private key
-- `acme/` — Let's Encrypt account data (when `auto: true`)
+Files under `TLS_DIR`:
 
-In `configs/root.yaml` enable TLS without paths:
+- `fullchain.pem` / `privkey.pem` — served cert
+- `acme/` — Let's Encrypt account data
 
-```yaml
-tls:
-  enabled: true
-  auto: true                 # fetch into TLS_DIR when files are missing/expired
-  # staging: true
-```
-
-- `auto: false` — you must place `fullchain.pem` / `privkey.pem` under `TLS_DIR` yourself  
-- `auto: true` — Konnector writes those files into `TLS_DIR`, then serves from them  
-
-DNS must point at the server; port **80** must be reachable for HTTP-01.
+Until a real cert is ready, Konnector serves a temporary self-signed cert so `:443` still listens.
 
 ## Logs
 

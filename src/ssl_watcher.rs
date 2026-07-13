@@ -96,13 +96,22 @@ fn handle_tls_change(
     provider: &configs::TlsProviderConfig,
     reason: &str,
 ) {
-    let domains = ssl::proxied_tls_domains(sites);
     let kind = provider.resolve(sites);
+    let domains = ssl::certificate_domains(sites, kind);
     let needs_refresh = match ssl::validate_certificate_files(https, &domains) {
         Ok(()) => {
-            if kind == configs::TlsProviderKind::Acme
-                && crate::acme::certificate_expires_within(&https.certificate_path, 30)
-            {
+            // Certbot-style: renew before expiry for ACME and Cloudflare Origin CA.
+            let renew_soon = matches!(
+                kind,
+                configs::TlsProviderKind::Acme
+                    | configs::TlsProviderKind::Cloudflare
+                    | configs::TlsProviderKind::Command
+            ) && crate::acme::certificate_expires_within(&https.certificate_path, 30);
+            if renew_soon {
+                watcher_log(
+                    "INFO",
+                    &format!("TLS certificate expires within 30 days; renewing ({reason})"),
+                );
                 true
             } else if reason == "file change" {
                 watcher_log(
@@ -126,19 +135,22 @@ fn handle_tls_change(
         return;
     }
     match ssl::refresh_certificate(https, sites, provider) {
-        Ok(()) => match ssl::validate_certificate_files(https, &domains) {
-            Ok(()) => {
-                watcher_log(
-                    "INFO",
-                    "TLS certificate refreshed successfully; restarting",
-                );
-                std::process::exit(RESTART_EXIT_CODE);
+        Ok(()) => {
+            let domains = ssl::certificate_domains(sites, kind);
+            match ssl::validate_certificate_files(https, &domains) {
+                Ok(()) => {
+                    watcher_log(
+                        "INFO",
+                        "TLS certificate refreshed successfully; restarting",
+                    );
+                    std::process::exit(RESTART_EXIT_CODE);
+                }
+                Err(error) => watcher_log(
+                    "ERROR",
+                    &format!("refreshed TLS certificate is still invalid: {error}"),
+                ),
             }
-            Err(error) => watcher_log(
-                "ERROR",
-                &format!("refreshed TLS certificate is still invalid: {error}"),
-            ),
-        },
+        }
         Err(error) => watcher_log(
             "ERROR",
             &format!("TLS certificate refresh failed: {error}"),

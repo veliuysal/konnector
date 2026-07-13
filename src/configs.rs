@@ -49,7 +49,7 @@ pub struct SiteConfig {
     /// Hostnames this site serves over HTTP/HTTPS (exact or `*.example.com`).
     #[serde(deserialize_with = "deserialize_domains")]
     pub domains: Vec<String>,
-    /// Listener this site answers on: `http` (default), `https`, or `both`.
+    /// Listener this site answers on: `both` (default), `http`, or `https`.
     /// Same hostname can be split across YAMLs (e.g. one `listen: http`, one `listen: https`).
     #[serde(default, deserialize_with = "deserialize_listen")]
     pub listen: ListenMode,
@@ -120,7 +120,8 @@ pub struct ListenMode {
 
 impl Default for ListenMode {
     fn default() -> Self {
-        Self::http_only()
+        // Default sites answer on both plain HTTP and TLS (needed for Cloudflare origin HTTPS).
+        Self::both()
     }
 }
 
@@ -596,8 +597,15 @@ const TLS_CERT_FILE: &str = "fullchain.pem";
 const TLS_KEY_FILE: &str = "privkey.pem";
 
 fn resolve_tls_config(yaml: &RootTlsSettings) -> (Option<HttpsConfig>, TlsProviderConfig) {
-    let env_enabled = env_bool("TLS_ENABLED", false);
-    let enabled = env_enabled || yaml.enabled;
+    let cloudflare_api_token = env_optional("CLOUDFLARE_API_TOKEN");
+    // SSL is on by default so the server can serve HTTPS without the user
+    // knowing about providers. Set TLS_ENABLED=false to disable.
+    let enabled = env_bool("TLS_ENABLED", true) || yaml.enabled || cloudflare_api_token.is_some();
+    // Allow an explicit off even when yaml/token would enable.
+    let enabled = match env::var("TLS_ENABLED").as_deref().map(str::trim) {
+        Ok("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
+        _ => enabled,
+    };
     if !enabled {
         return (None, TlsProviderConfig::default());
     }
@@ -607,20 +615,49 @@ fn resolve_tls_config(yaml: &RootTlsSettings) -> (Option<HttpsConfig>, TlsProvid
     let certificate_path = tls_root.join(TLS_CERT_FILE).to_string_lossy().into_owned();
     let private_key_path = tls_root.join(TLS_KEY_FILE).to_string_lossy().into_owned();
 
+    // Provider is chosen automatically unless the user overrides TLS_PROVIDER.
     let provider = match env_string("TLS_PROVIDER", "").to_ascii_lowercase().as_str() {
         "acme" | "letsencrypt" => TlsProviderKind::Acme,
         "cloudflare" => TlsProviderKind::Cloudflare,
         "command" => TlsProviderKind::Command,
-        "none" | "" if yaml.auto => TlsProviderKind::Acme,
-        "none" | "" => TlsProviderKind::None,
+        "none" => TlsProviderKind::None,
+        "" if cloudflare_api_token.is_some() => TlsProviderKind::Cloudflare,
+        "" => TlsProviderKind::Acme,
         other => {
-            log::warn!("invalid TLS_PROVIDER value '{other}'; using default");
-            if yaml.auto {
-                TlsProviderKind::Acme
+            log::warn!("invalid TLS_PROVIDER value '{other}'; auto-selecting certificate source");
+            if cloudflare_api_token.is_some() {
+                TlsProviderKind::Cloudflare
             } else {
-                TlsProviderKind::None
+                TlsProviderKind::Acme
             }
         }
+    };
+
+    match provider {
+        TlsProviderKind::Cloudflare if cloudflare_api_token.is_some() => {
+            log::info!("HTTPS on; certificates via Cloudflare Origin CA (CLOUDFLARE_API_TOKEN)");
+        }
+        TlsProviderKind::Cloudflare => {
+            log::warn!(
+                "HTTPS on with Cloudflare selected but CLOUDFLARE_API_TOKEN is missing; \
+                 falling back to Let's Encrypt"
+            );
+        }
+        TlsProviderKind::Acme => {
+            log::info!("HTTPS on; certificates via Let's Encrypt (automatic)");
+        }
+        TlsProviderKind::None => {
+            log::info!("HTTPS on; using existing files in {tls_dir} (no auto-issue)");
+        }
+        TlsProviderKind::Command => {
+            log::info!("HTTPS on; certificates via TLS_FETCH_COMMAND");
+        }
+    }
+
+    let provider = if provider == TlsProviderKind::Cloudflare && cloudflare_api_token.is_none() {
+        TlsProviderKind::Acme
+    } else {
+        provider
     };
 
     (
@@ -630,7 +667,7 @@ fn resolve_tls_config(yaml: &RootTlsSettings) -> (Option<HttpsConfig>, TlsProvid
         }),
         TlsProviderConfig {
             provider,
-            cloudflare_api_token: env_optional("CLOUDFLARE_API_TOKEN"),
+            cloudflare_api_token,
             fetch_command: env_optional("TLS_FETCH_COMMAND"),
             check_interval_seconds: env_u64("TLS_CHECK_INTERVAL_SECONDS", 21_600),
             acme_staging: env_bool("ACME_STAGING", yaml.staging),
@@ -1400,7 +1437,7 @@ tls:
     }
 
     #[test]
-    fn root_tls_manual_mode_does_not_enable_acme() {
+    fn root_tls_enabled_without_token_defaults_to_acme() {
         let _guard = ENV_LOCK.lock().unwrap();
         let root: RootConfig = serde_yaml::from_str(
             r#"
@@ -1412,11 +1449,56 @@ tls:
         .unwrap();
         let settings = RootSettings::try_from(root).unwrap();
         env::set_var("TLS_DIR", "/data/certs");
+        env::remove_var("CLOUDFLARE_API_TOKEN");
+        env::remove_var("TLS_PROVIDER");
         let (https, provider) = resolve_tls_config(&settings.tls);
         env::remove_var("TLS_DIR");
         assert!(https.is_some());
-        assert_eq!(provider.provider, TlsProviderKind::None);
+        assert_eq!(provider.provider, TlsProviderKind::Acme);
         assert_eq!(provider.tls_dir.as_deref(), Some("/data/certs"));
+    }
+
+    #[test]
+    fn https_is_on_by_default_with_automatic_acme() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("TLS_ENABLED");
+        env::remove_var("TLS_PROVIDER");
+        env::remove_var("CLOUDFLARE_API_TOKEN");
+        env::set_var("TLS_DIR", "/data/certs");
+        let (https, provider) = resolve_tls_config(&RootSettings::default().tls);
+        env::remove_var("TLS_DIR");
+        assert!(https.is_some());
+        assert_eq!(provider.provider, TlsProviderKind::Acme);
+    }
+
+    #[test]
+    fn tls_enabled_false_disables_https() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("TLS_ENABLED", "false");
+        env::remove_var("CLOUDFLARE_API_TOKEN");
+        let (https, _) = resolve_tls_config(&RootSettings::default().tls);
+        env::remove_var("TLS_ENABLED");
+        assert!(https.is_none());
+    }
+
+    #[test]
+    fn cloudflare_api_token_auto_selects_origin_ca() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("TLS_ENABLED");
+        env::remove_var("TLS_PROVIDER");
+        env::set_var("TLS_DIR", "/data/certs");
+        env::set_var("CLOUDFLARE_API_TOKEN", "cf-test-token");
+        let (https, provider) = resolve_tls_config(&RootSettings::default().tls);
+        env::remove_var("TLS_DIR");
+        env::remove_var("CLOUDFLARE_API_TOKEN");
+
+        let https = https.expect("https enabled");
+        assert_eq!(https.certificate_path, "/data/certs/fullchain.pem");
+        assert_eq!(provider.provider, TlsProviderKind::Cloudflare);
+        assert_eq!(
+            provider.cloudflare_api_token.as_deref(),
+            Some("cf-test-token")
+        );
     }
 
     #[test]

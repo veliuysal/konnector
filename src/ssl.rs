@@ -13,6 +13,16 @@ const CLOUDFLARE_ORIGIN_CERT_URL: &str = "https://api.cloudflare.com/client/v4/c
 const DEFAULT_ORIGIN_VALIDITY_DAYS: u32 = 5475;
 
 pub fn proxied_tls_domains(sites: &[SiteConfig]) -> Vec<String> {
+    proxied_tls_domains_with(sites, false)
+}
+
+/// Domains for certificate issuance. Cloudflare Origin CA can cover wildcards.
+pub fn certificate_domains(sites: &[SiteConfig], kind: TlsProviderKind) -> Vec<String> {
+    let allow_wildcards = kind == TlsProviderKind::Cloudflare;
+    proxied_tls_domains_with(sites, allow_wildcards)
+}
+
+fn proxied_tls_domains_with(sites: &[SiteConfig], allow_wildcards: bool) -> Vec<String> {
     let mut domains = HashSet::new();
     for site in sites {
         if !site.listen.https {
@@ -21,14 +31,16 @@ pub fn proxied_tls_domains(sites: &[SiteConfig]) -> Vec<String> {
         for domain in &site.domains {
             let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
             if crate::domain_routing::is_wildcard(&normalized) {
-                // Let's Encrypt HTTP-01 cannot issue wildcard certs; skip for ACME SAN list.
-                // Routing still matches *.example.com. Use Cloudflare Origin CA for *. certs,
-                // or list each subdomain explicitly for ACME.
-                log::warn!(
-                    "skipping wildcard {normalized} for certificate issuance; \
-                     list concrete hostnames for Let's Encrypt, or use Cloudflare for *. certs"
-                );
-                continue;
+                if !allow_wildcards {
+                    // Let's Encrypt HTTP-01 cannot issue wildcard certs; skip for ACME SAN list.
+                    // Routing still matches *.example.com. Use Cloudflare Origin CA for *. certs,
+                    // or list each subdomain explicitly for ACME.
+                    log::warn!(
+                        "skipping wildcard {normalized} for certificate issuance; \
+                         list concrete hostnames for Let's Encrypt, or use Cloudflare for *. certs"
+                    );
+                    continue;
+                }
             }
             if is_tls_dns_name(&normalized) {
                 domains.insert(normalized);
@@ -60,22 +72,49 @@ pub fn ensure_valid_certificate(
     sites: &[SiteConfig],
     provider: &TlsProviderConfig,
 ) -> Result<(), String> {
-    let domains = proxied_tls_domains(sites);
-    if domains.is_empty() {
-        return validate_certificate_files(https, &[]);
-    }
     let kind = provider.resolve(sites);
+    let domains = certificate_domains(sites, kind);
+    if domains.is_empty() {
+        log::warn!(
+            "HTTPS is enabled but no site domains are ready yet; \
+             serving a temporary self-signed certificate until sites are configured"
+        );
+        let placeholder = vec!["localhost".to_owned()];
+        let _ = crate::acme::prepare_for_startup(https, &placeholder, provider)?;
+        return Ok(());
+    }
     if kind == TlsProviderKind::Acme {
         // ACME needs HTTP-01 on :80; placeholder certs may be used until issuance finishes.
         let _ = crate::acme::prepare_for_startup(https, &domains, provider)?;
         return Ok(());
     }
+    // Cloudflare / command: issue or renew like certbot when missing, mismatched, or expiring.
     match validate_certificate_files(https, &domains) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if crate::acme::certificate_expires_within(&https.certificate_path, 30) {
+                log::info!("TLS certificate expires within 30 days; renewing");
+                refresh_certificate(https, sites, provider)?;
+                let domains = certificate_domains(sites, kind);
+                validate_certificate_files(https, &domains)?;
+            }
+            Ok(())
+        }
         Err(error) => {
-            log::warn!("TLS certificate mismatch: {error}");
-            refresh_certificate(https, sites, provider)?;
-            validate_certificate_files(https, &domains)
+            log::warn!("TLS certificate needs issuance/renewal: {error}");
+            match refresh_certificate(https, sites, provider) {
+                Ok(()) => {
+                    let domains = certificate_domains(sites, kind);
+                    validate_certificate_files(https, &domains)
+                }
+                Err(refresh_error) => {
+                    log::warn!(
+                        "auto certificate fetch failed ({refresh_error}); \
+                         installing temporary self-signed cert so HTTPS can still listen"
+                    );
+                    let _ = crate::acme::prepare_for_startup(https, &domains, provider)?;
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -105,11 +144,11 @@ pub fn refresh_certificate(
     sites: &[SiteConfig],
     provider: &TlsProviderConfig,
 ) -> Result<(), String> {
-    let domains = proxied_tls_domains(sites);
+    let kind = provider.resolve(sites);
+    let domains = certificate_domains(sites, kind);
     if domains.is_empty() {
         return Err("no proxied DNS domains require TLS coverage".into());
     }
-    let kind = provider.resolve(sites);
     match kind {
         TlsProviderKind::Acme => {
             log::info!(
@@ -123,7 +162,7 @@ pub fn refresh_certificate(
                 .cloudflare_api_token
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
-                .ok_or("CLOUDFLARE_API_TOKEN is required for TLS_PROVIDER=cloudflare")?;
+                .ok_or("CLOUDFLARE_API_TOKEN is required for Cloudflare Origin CA")?;
             let hostnames = cloudflare_hostnames(&domains);
             log::info!(
                 "requesting Cloudflare origin certificate for {}",
@@ -144,7 +183,8 @@ pub fn refresh_certificate(
             Ok(())
         }
         TlsProviderKind::None => Err(
-            "TLS certificate mismatch and no TLS provider is configured; set TLS_PROVIDER=acme"
+            "TLS certificate mismatch and no TLS provider is configured; \
+             set CLOUDFLARE_API_TOKEN or TLS_PROVIDER=acme"
                 .into(),
         ),
     }
@@ -374,14 +414,21 @@ impl TlsProviderConfig {
             TlsProviderKind::Cloudflare => TlsProviderKind::Cloudflare,
             TlsProviderKind::Command => TlsProviderKind::Command,
             TlsProviderKind::None => {
-                if self.cloudflare_api_token.is_some()
-                    && sites
-                        .iter()
-                        .any(|site| matches!(site.forwarding, ForwardingConfig::Cloudflare))
+                // Token alone selects Cloudflare Origin CA (no TLS_PROVIDER / forwarding required).
+                if self
+                    .cloudflare_api_token
+                    .as_deref()
+                    .is_some_and(|token| !token.trim().is_empty())
                 {
                     TlsProviderKind::Cloudflare
                 } else if self.fetch_command.is_some() {
                     TlsProviderKind::Command
+                } else if sites
+                    .iter()
+                    .any(|site| matches!(site.forwarding, ForwardingConfig::Cloudflare))
+                {
+                    // Legacy hint: cloudflare forwarding without token still does not issue.
+                    TlsProviderKind::None
                 } else {
                     TlsProviderKind::None
                 }

@@ -377,7 +377,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(site.traffic, TrafficMode::http_only());
-        assert_eq!(site.listen, ListenMode::http_only());
+        assert_eq!(site.listen, ListenMode::both());
     }
 
     #[test]

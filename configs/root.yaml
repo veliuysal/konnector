@@ -19,10 +19,9 @@ http:
 #   {TLS_DIR}/acme/
 #
 # tls:
-#   enabled: true
-#   auto: true              # fetch Let's Encrypt into TLS_DIR when missing
+#   enabled: true            # or set TLS_ENABLED=true — uses Let's Encrypt by default
 #   staging: false
-
+# With CLOUDFLARE_API_TOKEN in env, Origin CA is used instead of Let's Encrypt.
 # Direct (single instance) shorthand:
 # upstream:
 #   instance: 127.0.0.1:3000
