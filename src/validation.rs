@@ -68,20 +68,34 @@ pub fn validate_server(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), 
         if https.certificate_path.trim().is_empty() || https.private_key_path.trim().is_empty() {
             return Err("HTTPS certificate and private key must not be empty".into());
         }
-        if !Path::new(&https.certificate_path).is_file() {
-            return Err(format!(
-                "HTTPS certificate file does not exist: {}",
-                https.certificate_path
-            ));
+        let auto = matches!(
+            root.tls_provider.resolve(sites),
+            crate::configs::TlsProviderKind::Acme
+        );
+        let cert_exists = Path::new(&https.certificate_path).is_file();
+        let key_exists = Path::new(&https.private_key_path).is_file();
+        if !auto {
+            if !cert_exists {
+                return Err(format!(
+                    "HTTPS certificate file does not exist: {} (set tls.auto: true to obtain it)",
+                    https.certificate_path
+                ));
+            }
+            if !key_exists {
+                return Err(format!(
+                    "HTTPS private key file does not exist: {}",
+                    https.private_key_path
+                ));
+            }
+            let domains = ssl::proxied_tls_domains(sites);
+            ssl::validate_certificate_files(https, &domains)?;
+        } else if cert_exists && key_exists {
+            let domains = ssl::proxied_tls_domains(sites);
+            // Allow temporary/invalid files when auto will refresh them.
+            if let Err(error) = ssl::validate_certificate_files(https, &domains) {
+                log::warn!("existing TLS files at configured paths are not ready yet: {error}");
+            }
         }
-        if !Path::new(&https.private_key_path).is_file() {
-            return Err(format!(
-                "HTTPS private key file does not exist: {}",
-                https.private_key_path
-            ));
-        }
-        let domains = ssl::proxied_tls_domains(sites);
-        ssl::validate_certificate_files(https, &domains)?;
     }
     if root.http_listen == root.https_listen {
         return Err("HTTP and HTTPS listeners must be different".into());

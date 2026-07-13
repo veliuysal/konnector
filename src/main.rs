@@ -1,4 +1,6 @@
 mod access_control;
+mod acme;
+mod acme_challenge;
 mod application;
 mod cache_policy;
 mod cli;

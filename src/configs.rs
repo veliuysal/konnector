@@ -10,6 +10,7 @@ pub struct ServerConfig {
     pub https_listen: String,
     pub threads: usize,
     pub https: Option<HttpsConfig>,
+    pub tls_provider: TlsProviderConfig,
     pub root_proxy: Option<ProxyTarget>,
     pub logging: LogLevel,
 }
@@ -20,17 +21,22 @@ pub struct HttpsConfig {
     pub private_key_path: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TlsProviderConfig {
     pub provider: TlsProviderKind,
     pub cloudflare_api_token: Option<String>,
     pub fetch_command: Option<String>,
     pub check_interval_seconds: u64,
+    pub acme_staging: bool,
+    /// Root TLS directory from env `TLS_DIR` (holds fullchain.pem, privkey.pem, acme/).
+    pub tls_dir: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TlsProviderKind {
+    #[default]
     None,
+    Acme,
     Cloudflare,
     Command,
 }
@@ -306,6 +312,7 @@ fn default_threads() -> usize {
 pub fn server() -> ServerConfig {
     let directory = config_dir();
     let (path, root) = load_root_settings(&directory);
+    let (https, tls_provider) = resolve_tls_config(&root.tls);
     ServerConfig {
         http_listen: env::var("HTTP_LISTEN").unwrap_or_else(|_| "0.0.0.0:80".to_owned()),
         https_listen: env::var("HTTPS_LISTEN").unwrap_or_else(|_| "0.0.0.0:443".to_owned()),
@@ -313,15 +320,12 @@ pub fn server() -> ServerConfig {
             .ok()
             .map(|value| value.parse().expect("THREADS must be a number"))
             .unwrap_or_else(default_threads),
-        https: https_from_env(),
+        https,
+        tls_provider,
         root_proxy: root_proxy_from_env()
             .or_else(|| root_proxy_from_settings(path.as_deref(), &root)),
         logging: root.logging,
     }
-}
-
-pub fn tls_provider() -> TlsProviderConfig {
-    tls_provider_from_env()
 }
 
 #[cfg(test)]
@@ -421,30 +425,89 @@ fn load_site_file(path: &Path) -> Result<SiteConfig, String> {
         .map_err(|error| format!("invalid YAML in {}: {error}", path.display()))
 }
 
-fn https_from_env() -> Option<HttpsConfig> {
-    env_bool("TLS_ENABLED", false).then(|| HttpsConfig {
-        certificate_path: required_env("TLS_CERT_PATH"),
-        private_key_path: required_env("TLS_KEY_PATH"),
-    })
+/// TLS flags from `root.yaml`. File paths are never set here — they come from env `TLS_DIR`:
+/// `{TLS_DIR}/fullchain.pem`, `{TLS_DIR}/privkey.pem`, `{TLS_DIR}/acme/`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootTlsConfig {
+    #[serde(default)]
+    enabled: bool,
+    /// When true, obtain/renew Let's Encrypt certs into `TLS_DIR`.
+    /// When false, the server only reads existing files from `TLS_DIR`.
+    #[serde(default)]
+    auto: bool,
+    #[serde(default)]
+    staging: bool,
 }
 
-fn tls_provider_from_env() -> TlsProviderConfig {
+#[derive(Clone, Debug, Default)]
+struct RootTlsSettings {
+    enabled: bool,
+    auto: bool,
+    staging: bool,
+}
+
+impl From<RootTlsConfig> for RootTlsSettings {
+    fn from(config: RootTlsConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            auto: config.auto,
+            staging: config.staging,
+        }
+    }
+}
+
+const TLS_CERT_FILE: &str = "fullchain.pem";
+const TLS_KEY_FILE: &str = "privkey.pem";
+
+fn resolve_tls_config(yaml: &RootTlsSettings) -> (Option<HttpsConfig>, TlsProviderConfig) {
+    let env_enabled = env_bool("TLS_ENABLED", false);
+    let enabled = env_enabled || yaml.enabled;
+    if !enabled {
+        return (None, TlsProviderConfig::default());
+    }
+
+    let tls_dir = env::var("TLS_DIR")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "TLS is enabled but TLS_DIR is not set; set the certificate root folder in the env file \
+                 (e.g. TLS_DIR=/etc/ssl/konnector)"
+            )
+        });
+    let tls_root = PathBuf::from(&tls_dir);
+    let certificate_path = tls_root.join(TLS_CERT_FILE).to_string_lossy().into_owned();
+    let private_key_path = tls_root.join(TLS_KEY_FILE).to_string_lossy().into_owned();
+
     let provider = match env::var("TLS_PROVIDER").as_deref() {
+        Ok("acme") | Ok("letsencrypt") => TlsProviderKind::Acme,
         Ok("cloudflare") => TlsProviderKind::Cloudflare,
         Ok("command") => TlsProviderKind::Command,
-        Ok("none") | Ok("") => TlsProviderKind::None,
-        Err(_) => TlsProviderKind::None,
+        Ok("none") => TlsProviderKind::None,
+        Ok("") | Err(_) if yaml.auto => TlsProviderKind::Acme,
+        Ok("") | Err(_) => TlsProviderKind::None,
         Ok(value) => panic!("invalid TLS_PROVIDER value: {value}"),
     };
-    TlsProviderConfig {
-        provider,
-        cloudflare_api_token: env::var("CLOUDFLARE_API_TOKEN").ok(),
-        fetch_command: env::var("TLS_FETCH_COMMAND").ok(),
-        check_interval_seconds: env::var("TLS_CHECK_INTERVAL_SECONDS")
-            .ok()
-            .map(|value| value.parse().expect("TLS_CHECK_INTERVAL_SECONDS must be a number"))
-            .unwrap_or(21_600),
-    }
+
+    (
+        Some(HttpsConfig {
+            certificate_path,
+            private_key_path,
+        }),
+        TlsProviderConfig {
+            provider,
+            cloudflare_api_token: env::var("CLOUDFLARE_API_TOKEN").ok(),
+            fetch_command: env::var("TLS_FETCH_COMMAND").ok(),
+            check_interval_seconds: env::var("TLS_CHECK_INTERVAL_SECONDS")
+                .ok()
+                .map(|value| value.parse().expect("TLS_CHECK_INTERVAL_SECONDS must be a number"))
+                .unwrap_or(21_600),
+            acme_staging: env_bool("ACME_STAGING", yaml.staging),
+            tls_dir: Some(tls_dir),
+        },
+    )
 }
 
 fn is_site_config(path: &Path) -> bool {
@@ -655,6 +718,8 @@ struct RootConfig {
     logging: LoggingConfig,
     #[serde(default)]
     http: HttpSettings,
+    #[serde(default)]
+    tls: RootTlsConfig,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -663,6 +728,7 @@ struct RootSettings {
     target: Option<ProxyTarget>,
     logging: LogLevel,
     http_version: HttpVersion,
+    tls: RootTlsSettings,
 }
 
 impl TryFrom<RootConfig> for RootSettings {
@@ -682,6 +748,7 @@ impl TryFrom<RootConfig> for RootSettings {
             target,
             logging: config.logging.level,
             http_version: config.http.version,
+            tls: config.tls.into(),
         })
     }
 }
@@ -866,13 +933,6 @@ fn env_bool(name: &str, default: bool) -> bool {
     }
 }
 
-fn required_env(name: &str) -> String {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| panic!("{name} is required when TLS_ENABLED=true"))
-}
-
 fn default_true() -> bool {
     true
 }
@@ -961,6 +1021,52 @@ mod tests {
         assert!(upstream.enabled);
         assert!(upstream.upstream.is_none());
         assert!(upstream.proxy.is_none());
+    }
+
+    #[test]
+    fn root_tls_auto_uses_tls_dir_from_env() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+tls:
+  enabled: true
+  auto: true
+  staging: true
+"#,
+        )
+        .unwrap();
+        let settings = RootSettings::try_from(root).unwrap();
+        assert!(settings.tls.enabled);
+        assert!(settings.tls.auto);
+
+        env::set_var("TLS_DIR", "/data/certs");
+        let (https, provider) = resolve_tls_config(&settings.tls);
+        env::remove_var("TLS_DIR");
+
+        let https = https.expect("https enabled");
+        assert_eq!(https.certificate_path, "/data/certs/fullchain.pem");
+        assert_eq!(https.private_key_path, "/data/certs/privkey.pem");
+        assert_eq!(provider.provider, TlsProviderKind::Acme);
+        assert_eq!(provider.tls_dir.as_deref(), Some("/data/certs"));
+        assert!(provider.acme_staging);
+    }
+
+    #[test]
+    fn root_tls_manual_mode_does_not_enable_acme() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+tls:
+  enabled: true
+  auto: false
+"#,
+        )
+        .unwrap();
+        let settings = RootSettings::try_from(root).unwrap();
+        env::set_var("TLS_DIR", "/data/certs");
+        let (https, provider) = resolve_tls_config(&settings.tls);
+        env::remove_var("TLS_DIR");
+        assert!(https.is_some());
+        assert_eq!(provider.provider, TlsProviderKind::None);
+        assert_eq!(provider.tls_dir.as_deref(), Some("/data/certs"));
     }
 
     #[test]

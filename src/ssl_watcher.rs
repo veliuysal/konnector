@@ -12,7 +12,7 @@ pub fn start(root: configs::ServerConfig, sites: Vec<configs::SiteConfig>) {
     let Some(https) = root.https.clone() else {
         return;
     };
-    let provider = configs::tls_provider();
+    let provider = root.tls_provider.clone();
     let check_interval = Duration::from_secs(provider.check_interval_seconds);
     let watch_paths = ssl::watch_paths(&https);
 
@@ -60,26 +60,37 @@ fn handle_tls_change(
     reason: &str,
 ) {
     let domains = ssl::proxied_tls_domains(sites);
-    match ssl::validate_certificate_files(https, &domains) {
+    let kind = provider.resolve(sites);
+    let needs_refresh = match ssl::validate_certificate_files(https, &domains) {
         Ok(()) => {
-            if reason == "file change" {
+            if kind == configs::TlsProviderKind::Acme
+                && crate::acme::certificate_expires_within(&https.certificate_path, 30)
+            {
+                true
+            } else if reason == "file change" {
                 log::info!("valid TLS certificate change detected; restarting");
                 std::process::exit(RESTART_EXIT_CODE);
+            } else {
+                false
             }
         }
         Err(error) => {
             log::warn!("TLS certificate check failed during {reason}: {error}");
-            match ssl::refresh_certificate(https, sites, provider) {
-                Ok(()) => match ssl::validate_certificate_files(https, &domains) {
-                    Ok(()) => {
-                        log::info!("TLS certificate refreshed successfully; restarting");
-                        std::process::exit(RESTART_EXIT_CODE);
-                    }
-                    Err(error) => log::error!("refreshed TLS certificate is still invalid: {error}"),
-                },
-                Err(error) => log::error!("TLS certificate refresh failed: {error}"),
-            }
+            true
         }
+    };
+    if !needs_refresh {
+        return;
+    }
+    match ssl::refresh_certificate(https, sites, provider) {
+        Ok(()) => match ssl::validate_certificate_files(https, &domains) {
+            Ok(()) => {
+                log::info!("TLS certificate refreshed successfully; restarting");
+                std::process::exit(RESTART_EXIT_CODE);
+            }
+            Err(error) => log::error!("refreshed TLS certificate is still invalid: {error}"),
+        },
+        Err(error) => log::error!("TLS certificate refresh failed: {error}"),
     }
 }
 

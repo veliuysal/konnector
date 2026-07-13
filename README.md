@@ -100,6 +100,34 @@ sudo konnector restart
 konnector restart
 ```
 
+## Automatic HTTPS (Let's Encrypt)
+
+Set the certificate **root folder** in the env file only:
+
+```text
+TLS_DIR=/etc/ssl/konnector
+```
+
+Files used under that folder (never set as paths in YAML):
+
+- `fullchain.pem` — certificate chain (server always loads this)
+- `privkey.pem` — private key
+- `acme/` — Let's Encrypt account data (when `auto: true`)
+
+In `configs/root.yaml` enable TLS without paths:
+
+```yaml
+tls:
+  enabled: true
+  auto: true                 # fetch into TLS_DIR when files are missing/expired
+  # staging: true
+```
+
+- `auto: false` — you must place `fullchain.pem` / `privkey.pem` under `TLS_DIR` yourself  
+- `auto: true` — Konnector writes those files into `TLS_DIR`, then serves from them  
+
+DNS must point at the server; port **80** must be reachable for HTTP-01.
+
 ## Commands
 
 ```sh

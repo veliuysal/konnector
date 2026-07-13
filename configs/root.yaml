@@ -13,6 +13,16 @@ logging:
 http:
   version: auto
 
+# TLS flags only — certificate paths come from env TLS_DIR (not from YAML):
+#   {TLS_DIR}/fullchain.pem
+#   {TLS_DIR}/privkey.pem
+#   {TLS_DIR}/acme/
+#
+# tls:
+#   enabled: true
+#   auto: true              # fetch Let's Encrypt into TLS_DIR when missing
+#   staging: false
+
 # Direct (single instance) shorthand:
 # upstream:
 #   instance: 127.0.0.1:3000

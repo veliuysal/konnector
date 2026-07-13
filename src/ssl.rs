@@ -51,6 +51,12 @@ pub fn ensure_valid_certificate(
     if domains.is_empty() {
         return validate_certificate_files(https, &[]);
     }
+    let kind = provider.resolve(sites);
+    if kind == TlsProviderKind::Acme {
+        // ACME needs HTTP-01 on :80; placeholder certs may be used until issuance finishes.
+        let _ = crate::acme::prepare_for_startup(https, &domains, provider)?;
+        return Ok(());
+    }
     match validate_certificate_files(https, &domains) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -92,6 +98,13 @@ pub fn refresh_certificate(
     }
     let kind = provider.resolve(sites);
     match kind {
+        TlsProviderKind::Acme => {
+            log::info!(
+                "requesting Let's Encrypt certificate for {}",
+                domains.join(", ")
+            );
+            crate::acme::issue_certificate(https, &domains, provider)
+        }
         TlsProviderKind::Cloudflare => {
             let token = provider
                 .cloudflare_api_token
@@ -104,8 +117,7 @@ pub fn refresh_certificate(
                 hostnames.join(", ")
             );
             let (certificate, private_key) = fetch_cloudflare_origin_certificate(token, &hostnames)?;
-            write_atomic(&https.certificate_path, &certificate)?;
-            write_atomic(&https.private_key_path, &private_key)?;
+            write_certificate_files(https, &certificate, &private_key)?;
             Ok(())
         }
         TlsProviderKind::Command => {
@@ -119,7 +131,8 @@ pub fn refresh_certificate(
             Ok(())
         }
         TlsProviderKind::None => Err(
-            "TLS certificate mismatch and no TLS provider is configured; set TLS_PROVIDER".into(),
+            "TLS certificate mismatch and no TLS provider is configured; set TLS_PROVIDER=acme"
+                .into(),
         ),
     }
 }
@@ -232,6 +245,16 @@ fn write_atomic(path: &str, content: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn write_certificate_files(
+    https: &HttpsConfig,
+    certificate: &str,
+    private_key: &str,
+) -> Result<(), String> {
+    write_atomic(&https.certificate_path, certificate)?;
+    write_atomic(&https.private_key_path, private_key)?;
+    Ok(())
+}
+
 fn certificate_identities(cert_path: &str) -> Result<Vec<String>, String> {
     let pem = fs::read(cert_path)
         .map_err(|error| format!("cannot read certificate {}: {error}", cert_path))?;
@@ -322,6 +345,7 @@ fn is_tls_dns_name(domain: &str) -> bool {
 impl TlsProviderConfig {
     pub fn resolve(&self, sites: &[SiteConfig]) -> TlsProviderKind {
         match self.provider {
+            TlsProviderKind::Acme => TlsProviderKind::Acme,
             TlsProviderKind::Cloudflare => TlsProviderKind::Cloudflare,
             TlsProviderKind::Command => TlsProviderKind::Command,
             TlsProviderKind::None => {

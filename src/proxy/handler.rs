@@ -37,6 +37,10 @@ impl ProxyHttp for DomainProxy {
             ctx.skip_access_log = true;
             return Ok(true);
         }
+        if crate::acme_challenge::respond(session).await? {
+            ctx.skip_access_log = true;
+            return Ok(true);
+        }
         let routing = snapshot(&self.routing);
         let site_index = match domain_routing::site_for(session, &routing.sites) {
             Some(index) => index,
