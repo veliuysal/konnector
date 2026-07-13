@@ -45,6 +45,23 @@ pub fn init() {
     );
 }
 
+/// Create `logs/{stem}/` and record that this YAML is enabled and loggable.
+pub fn prepare_site(config_stem: &str, detail: &str) {
+    let stem = sanitize_name(config_stem);
+    let dir = paths::logs_dir().join(&stem);
+    if let Err(error) = fs::create_dir_all(&dir) {
+        eprintln!(
+            "konnector: cannot create site log directory {}: {error}",
+            dir.display()
+        );
+        return;
+    }
+    write_site(
+        &stem,
+        &format_line("INFO", &format!("site enabled; {detail}")),
+    );
+}
+
 pub fn main_log_path() -> PathBuf {
     paths::log_file()
 }

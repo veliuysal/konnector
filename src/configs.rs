@@ -79,10 +79,15 @@ impl SiteConfig {
     }
 
     pub fn resolved_logging(&self, default: LogLevel) -> LogLevel {
-        self.logging
-            .as_ref()
-            .map(|logging| logging.level)
-            .unwrap_or(default)
+        // Explicit site logging wins; otherwise inherit root, but enabled sites
+        // stay loggable (info) even when the root default is off.
+        self.logging.as_ref().map(|logging| logging.level).unwrap_or(
+            if default.is_enabled() {
+                default
+            } else {
+                LogLevel::Info
+            },
+        )
     }
 
     pub fn resolve_http_versions(&mut self) {
@@ -139,10 +144,10 @@ pub struct HttpSettings {
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
-    #[default]
     Off,
     Error,
     Warn,
+    #[default]
     Info,
     Debug,
 }
@@ -1015,6 +1020,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn site_enabled_defaults_to_true() {
@@ -1094,6 +1102,7 @@ mod tests {
 
     #[test]
     fn root_tls_defaults_tls_dir_when_env_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let root: RootConfig = serde_yaml::from_str(
             r#"
 tls:
@@ -1114,6 +1123,7 @@ tls:
 
     #[test]
     fn root_tls_auto_uses_tls_dir_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let root: RootConfig = serde_yaml::from_str(
             r#"
 tls:
@@ -1141,6 +1151,7 @@ tls:
 
     #[test]
     fn root_tls_manual_mode_does_not_enable_acme() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let root: RootConfig = serde_yaml::from_str(
             r#"
 tls:
@@ -1245,6 +1256,21 @@ proxy:
             many.domains,
             vec!["shop.com", "www.shop.com", "*.shop.com"]
         );
+    }
+
+    #[test]
+    fn enabled_sites_default_to_info_logging_when_root_is_off() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [shop.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: 127.0.0.1:3000\n",
+        )
+        .unwrap();
+        assert_eq!(site.resolved_logging(LogLevel::Off), LogLevel::Info);
+
+        let quiet: SiteConfig = serde_yaml::from_str(
+            "domains: [shop.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: 127.0.0.1:3000\nlogging:\n  level: off\n",
+        )
+        .unwrap();
+        assert_eq!(quiet.resolved_logging(LogLevel::Info), LogLevel::Off);
     }
 
     #[test]

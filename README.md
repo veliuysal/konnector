@@ -165,12 +165,15 @@ File logs (override with `LOGS_DIR`):
 ```text
 /etc/konnector/logs/
   main/konnector.log          # process / general logs
-  root/access.log             # root.yaml proxy traffic
-  example/access.log          # example.yaml proxy traffic
+  root/access.log             # root.yaml (when root proxy enabled)
+  shop/access.log             # shop.yaml traffic
+  blog/access.log             # blog.yaml traffic
   postgres.tcp/access.log     # *.tcp.yaml traffic
   watchers/config.log         # config watcher
   watchers/tls.log            # TLS watcher
 ```
+
+Every **enabled** YAML gets its own folder as soon as it loads. Access lines go there automatically (default `logging.level: info`; set `off` to silence a site).
 
 `konnector logs` shows `logs/main/konnector.log`.  
 `konnector logs example` shows that YAML’s access log.  

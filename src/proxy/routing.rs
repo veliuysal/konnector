@@ -130,13 +130,27 @@ pub fn reload_routing(routing: &SharedRouting) {
         log::error!("configuration reload skipped: {error}");
         return;
     }
-    let new_routing = build_proxy_routing(sites, root.root_proxy, root.logging, None);
+    for site in &sites {
+        let stem = if site.source_file.is_empty() {
+            site.primary_domain().to_owned()
+        } else {
+            site.source_file.clone()
+        };
+        crate::file_log::prepare_site(
+            &stem,
+            &format!("reloaded; domains={}", site.domains.join(", ")),
+        );
+    }
+    let new_routing = build_proxy_routing(sites, root.root_proxy.clone(), root.logging, None);
     let root_enabled = new_routing.root_site.is_some();
     let named_sites = if root_enabled {
         new_routing.sites.len().saturating_sub(1)
     } else {
         new_routing.sites.len()
     };
+    if root_enabled {
+        crate::file_log::prepare_site("root", "root proxy reloaded");
+    }
     {
         let mut guard = routing.write().expect("routing lock poisoned");
         *guard = Arc::new(new_routing);

@@ -33,7 +33,22 @@ impl TcpProxyManager {
             .expect("tcp proxy lock poisoned") = logging;
         self.stop_all();
         for config in configs {
-            self.start_one(config, logging);
+            let stem = if config.source_file.is_empty() {
+                config.name.clone()
+            } else {
+                config.source_file.clone()
+            };
+            crate::file_log::prepare_site(
+                &stem,
+                &format!("tcp enabled; listen={} name={}", config.listen, config.name),
+            );
+            // Enabled TCP YAMLs stay loggable even if root logging is off.
+            let level = if logging.is_enabled() {
+                logging
+            } else {
+                LogLevel::Info
+            };
+            self.start_one(config, level);
         }
     }
 

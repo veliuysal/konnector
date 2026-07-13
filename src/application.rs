@@ -17,18 +17,25 @@ pub fn run() {
         log::warn!("no valid site configs loaded; working page will be used for unmatched hosts");
     } else {
         for site in &sites {
-            let source = if site.source_file.is_empty() {
+            let stem = if site.source_file.is_empty() {
                 site.primary_domain().to_owned()
             } else {
-                format!("{}.yaml", site.source_file)
+                site.source_file.clone()
             };
-            log::info!(
-                "loaded site {source} -> {}",
-                site.domains.join(", ")
-            );
+            let detail = format!("domains={}", site.domains.join(", "));
+            file_log::prepare_site(&stem, &detail);
+            log::info!("loaded site {stem}.yaml -> {}", site.domains.join(", "));
         }
     }
     let root = configs::server();
+    if root.root_proxy.is_some() {
+        let level = if root.logging.is_enabled() {
+            "on"
+        } else {
+            "off"
+        };
+        file_log::prepare_site("root", &format!("root proxy enabled; logging={level}"));
+    }
     if root.root_proxy.is_some() && !root.logging.is_enabled() {
         log::warn!(
             "root proxy is enabled but logging.level is off; localhost and unmatched host requests will not be logged"
