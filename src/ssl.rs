@@ -55,16 +55,30 @@ fn proxied_tls_domains_with(sites: &[SiteConfig], allow_wildcards: bool) -> Vec<
 pub fn cloudflare_hostnames(domains: &[String]) -> Vec<String> {
     let mut hostnames = HashSet::new();
     for domain in domains {
-        hostnames.insert(domain.clone());
-        let labels: Vec<_> = domain.split('.').collect();
-        if labels.len() >= 2 {
-            let apex = labels[labels.len() - 2..].join(".");
+        let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        hostnames.insert(normalized.clone());
+        // Origin CA is issued on the zone (apex). Subdomains alone are not enough —
+        // always include apex + wildcard so CF can issue for the main domain.
+        if let Some(apex) = zone_apex(&normalized) {
+            hostnames.insert(apex.clone());
             hostnames.insert(format!("*.{apex}"));
         }
     }
     let mut list: Vec<_> = hostnames.into_iter().collect();
     list.sort();
     list
+}
+
+/// Best-effort registrable zone (`reg.kon.ag` / `www.reg.kon.ag` → `kon.ag`).
+fn zone_apex(domain: &str) -> Option<String> {
+    let labels: Vec<_> = domain.split('.').filter(|label| !label.is_empty()).collect();
+    if labels.len() < 2 {
+        return None;
+    }
+    Some(labels[labels.len() - 2..].join("."))
 }
 
 pub fn ensure_valid_certificate(
@@ -493,5 +507,20 @@ mod tests {
                 "example.com".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn cloudflare_hostnames_include_apex_for_subdomains() {
+        assert_eq!(
+            cloudflare_hostnames(&["reg.kon.ag".to_owned(), "www.reg.kon.ag".to_owned()]),
+            vec![
+                "*.kon.ag".to_owned(),
+                "kon.ag".to_owned(),
+                "reg.kon.ag".to_owned(),
+                "www.reg.kon.ag".to_owned(),
+            ]
+        );
+        assert_eq!(zone_apex("www.reg.kon.ag").as_deref(), Some("kon.ag"));
+        assert_eq!(zone_apex("kon.ag").as_deref(), Some("kon.ag"));
     }
 }
