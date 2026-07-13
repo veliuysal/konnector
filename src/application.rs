@@ -50,9 +50,29 @@ pub fn run() {
         ssl::ensure_valid_certificate(https, &sites, &provider)
             .unwrap_or_else(|error| panic!("TLS certificate error: {error}"));
         if provider.resolve(&sites) == configs::TlsProviderKind::Acme {
+            if sites.iter().any(|site| {
+                matches!(site.forwarding, configs::ForwardingConfig::Cloudflare)
+            }) && provider
+                .cloudflare_api_token
+                .as_deref()
+                .filter(|token| !token.trim().is_empty())
+                .is_none()
+            {
+                log::warn!(
+                    "using Let's Encrypt while site forwarding is cloudflare and \
+                     CLOUDFLARE_API_TOKEN is unset; HTTP-01 often fails behind orange-cloud \
+                     — prefer Origin CA via CLOUDFLARE_API_TOKEN"
+                );
+            }
             let domains = ssl::proxied_tls_domains(&sites);
             match ssl::validate_certificate_files(https, &domains) {
                 Ok(()) if !crate::acme::certificate_expires_within(&https.certificate_path, 30) => {}
+                _ if crate::acme::backoff_remaining(&provider).is_some() => {
+                    log::warn!(
+                        "ACME issuance is paused after recent failures; \
+                         serving existing/placeholder cert until cooldown ends"
+                    );
+                }
                 _ => acme_bootstrap = true,
             }
         }

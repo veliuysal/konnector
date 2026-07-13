@@ -98,9 +98,44 @@ fn handle_tls_change(
 ) {
     let kind = provider.resolve(sites);
     let domains = ssl::certificate_domains(sites, kind);
+
+    // Temporary self-signed placeholders expire in 7 days and would otherwise look
+    // "soon to renew" forever, which re-hammered Let's Encrypt after every write.
+    if kind == configs::TlsProviderKind::Acme {
+        if let Some(remaining) = crate::acme::backoff_remaining(provider) {
+            if reason == "file change" {
+                // Self-signed / failed-issue writes must not kick off another ACME order.
+                return;
+            }
+            watcher_log(
+                "INFO",
+                &format!(
+                    "skipping ACME retry ({reason}); paused for {remaining}s after recent failure"
+                ),
+            );
+            return;
+        }
+        if sites.iter().any(|site| {
+            matches!(
+                site.forwarding,
+                configs::ForwardingConfig::Cloudflare
+            )
+        }) && provider
+            .cloudflare_api_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+            .is_none()
+        {
+            watcher_log(
+                "WARN",
+                "site uses forwarding: cloudflare but CLOUDFLARE_API_TOKEN is unset; \
+                 HTTP-01 often fails behind orange-cloud — set the token for Origin CA",
+            );
+        }
+    }
+
     let needs_refresh = match ssl::validate_certificate_files(https, &domains) {
         Ok(()) => {
-            // Certbot-style: renew before expiry for ACME and Cloudflare Origin CA.
             let renew_soon = matches!(
                 kind,
                 configs::TlsProviderKind::Acme
@@ -108,6 +143,11 @@ fn handle_tls_change(
                     | configs::TlsProviderKind::Command
             ) && crate::acme::certificate_expires_within(&https.certificate_path, 30);
             if renew_soon {
+                // Placeholder self-signed certs are short-lived; only retry ACME on
+                // the scheduled interval, not on every notify of our own write.
+                if kind == configs::TlsProviderKind::Acme && reason == "file change" {
+                    return;
+                }
                 watcher_log(
                     "INFO",
                     &format!("TLS certificate expires within 30 days; renewing ({reason})"),
@@ -128,7 +168,12 @@ fn handle_tls_change(
                 "WARN",
                 &format!("TLS certificate check failed during {reason}: {error}"),
             );
-            true
+            // Do not loop ACME on every placeholder rewrite while validating fails.
+            if kind == configs::TlsProviderKind::Acme && reason == "file change" {
+                false
+            } else {
+                true
+            }
         }
     };
     if !needs_refresh {

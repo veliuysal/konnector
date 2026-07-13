@@ -20,13 +20,18 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 const RENEW_WITHIN_DAYS: u32 = 30;
 const BOOTSTRAP_DELAY: Duration = Duration::from_secs(3);
 const RESTART_EXIT_CODE: i32 = 75;
+/// Default cooldown after a normal ACME failure (avoids hammering LE).
+const BACKOFF_DEFAULT_SECS: u64 = 15 * 60;
+/// Cooldown when Let's Encrypt reports rate limiting / too many failed authorizations.
+const BACKOFF_RATE_LIMIT_SECS: u64 = 60 * 60;
+const BACKOFF_FILE: &str = "retry_after";
 
 static CHALLENGES: Lazy<Arc<RwLock<HashMap<String, String>>>> =
     Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
@@ -144,13 +149,94 @@ pub fn issue_certificate(
     if domains.is_empty() {
         return Err("ACME requires at least one DNS domain".into());
     }
+    if let Some(remaining) = backoff_remaining(provider) {
+        return Err(format!(
+            "ACME issuance paused for {remaining}s after recent failure \
+             (Let's Encrypt rate limit / auth failures); will retry later"
+        ));
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
         .thread_name("konnector-acme")
         .build()
         .map_err(|error| format!("cannot create ACME runtime: {error}"))?;
-    runtime.block_on(issue_certificate_async(https, domains, provider))
+    match runtime.block_on(issue_certificate_async(https, domains, provider)) {
+        Ok(()) => {
+            clear_backoff(provider);
+            Ok(())
+        }
+        Err(error) => {
+            set_backoff_from_error(provider, &error);
+            Err(error)
+        }
+    }
+}
+
+/// Seconds left in the ACME cooldown, if any.
+pub fn backoff_remaining(provider: &TlsProviderConfig) -> Option<u64> {
+    let path = backoff_path(provider);
+    let raw = fs::read_to_string(&path).ok()?;
+    let until = raw.trim().parse::<u64>().ok()?;
+    let now = unix_now();
+    if until > now {
+        Some(until - now)
+    } else {
+        let _ = fs::remove_file(path);
+        None
+    }
+}
+
+pub fn clear_backoff(provider: &TlsProviderConfig) {
+    let path = backoff_path(provider);
+    let _ = fs::remove_file(path);
+}
+
+fn backoff_path(provider: &TlsProviderConfig) -> PathBuf {
+    account_dir(provider).join(BACKOFF_FILE)
+}
+
+fn set_backoff_from_error(provider: &TlsProviderConfig, error: &str) {
+    let secs = if is_rate_limit_error(error) {
+        BACKOFF_RATE_LIMIT_SECS
+    } else {
+        BACKOFF_DEFAULT_SECS
+    };
+    let until = unix_now().saturating_add(secs);
+    let dir = account_dir(provider);
+    if let Err(error) = fs::create_dir_all(&dir) {
+        log::warn!("cannot create ACME backoff dir {}: {error}", dir.display());
+        return;
+    }
+    let path = backoff_path(provider);
+    if let Err(error) = fs::write(&path, until.to_string()) {
+        log::warn!("cannot write ACME backoff {}: {error}", path.display());
+        return;
+    }
+    log::warn!(
+        "pausing Let's Encrypt retries for {secs}s ({})",
+        if secs == BACKOFF_RATE_LIMIT_SECS {
+            "rate limit / failed authorizations"
+        } else {
+            "issuance failure"
+        }
+    );
+}
+
+pub fn is_rate_limit_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("rate limit")
+        || lower.contains("ratelimit")
+        || lower.contains("too many failed authorizations")
+        || lower.contains("too many certificates")
+        || lower.contains("retry after")
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn start_background_issuer(
@@ -161,6 +247,13 @@ pub fn start_background_issuer(
     thread::Builder::new()
         .name("acme-issuer".into())
         .spawn(move || {
+            if let Some(remaining) = backoff_remaining(&provider) {
+                log::warn!(
+                    "skipping Let's Encrypt bootstrap; ACME paused for {remaining}s \
+                     (fix HTTP-01 for the domains or set CLOUDFLARE_API_TOKEN for Origin CA)"
+                );
+                return;
+            }
             thread::sleep(BOOTSTRAP_DELAY);
             log::info!(
                 "requesting Let's Encrypt certificate for {}",
@@ -392,5 +485,14 @@ mod tests {
             challenge_token_from_path("/.well-known/acme-challenge/"),
             None
         );
+    }
+
+    #[test]
+    fn detects_rate_limit_errors() {
+        assert!(is_rate_limit_error(
+            "API error: too many failed authorizations (5) for \"www.reg.kon.ag\" in the last 1h0m0s"
+        ));
+        assert!(is_rate_limit_error("urn:ietf:params:acme:error:rateLimited"));
+        assert!(!is_rate_limit_error("connection refused"));
     }
 }
