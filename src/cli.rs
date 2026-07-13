@@ -109,7 +109,7 @@ Service:
   konnector disable
   konnector status
   konnector health
-  konnector logs [--follow] [--lines N]   # main/konnector.log
+  konnector logs [--follow] [--lines N] [main|example|watchers/config]
 
 Release:
   konnector install [tag|package|release-url]
@@ -605,6 +605,7 @@ fn verify_checksum(source: &str) -> Result<(), String> {
 fn cmd_logs(args: &[String]) -> Result<(), String> {
     let mut follow = false;
     let mut lines = "100".to_owned();
+    let mut target = "main".to_owned();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -613,11 +614,14 @@ fn cmd_logs(args: &[String]) -> Result<(), String> {
                 index += 1;
                 lines = args.get(index).cloned().unwrap_or_else(|| "100".to_owned());
             }
-            value => return Err(format!("unknown logs option: {value}")),
+            value if value.starts_with('-') => {
+                return Err(format!("unknown logs option: {value}"));
+            }
+            value => target = value.to_owned(),
         }
         index += 1;
     }
-    platform_ops::cmd_logs(follow, &lines)
+    platform_ops::cmd_logs(follow, &lines, &target)
 }
 
 fn cmd_install(args: &[String]) -> Result<(), String> {

@@ -75,6 +75,35 @@ sudo cp /opt/konnector/current/configs/example.yaml /etc/konnector/configs/mysit
 sudo nano /etc/konnector/configs/mysite.yaml
 ```
 
+In `mysite.yaml` set `enabled: true`, your upstream, and the hosts this site should answer:
+
+```yaml
+enabled: true
+domains:
+  - myapp.com
+  - www.myapp.com
+  - "*.myapp.com"    # optional: any one-level subdomain
+proxy:
+  mode: direct
+  upstream:
+    instance: 127.0.0.1:3000
+```
+
+Konnector already listens on HTTP/HTTPS (default `:80` / `:443`) for all sites; routing uses the request `Host`.  
+For Let's Encrypt, list concrete names (wildcards need Cloudflare Origin CA or DNS-01).
+
+Use **one YAML per site** (or group). Every `*.yaml` in `CONFIG_DIR` (except `root.yaml` and `*.tcp.yaml`) is loaded:
+
+```text
+configs/
+  shop.yaml      # shop.com, www.shop.com, *.shop.com
+  blog.yaml      # blog.example.org
+  api.yaml       # api.myapp.com
+  root.yaml      # fallback when Host matches no site
+```
+
+Exact hostnames win over wildcards when both could match.
+
 Set in `/etc/konnector.env`:
 
 ```text
@@ -143,7 +172,9 @@ File logs (override with `LOGS_DIR`):
   watchers/tls.log            # TLS watcher
 ```
 
-`konnector logs` shows `logs/main/konnector.log`. Access logs for each YAML live under that file’s named folder; watcher events under `logs/watchers/`.
+`konnector logs` shows `logs/main/konnector.log`.  
+`konnector logs example` shows that YAML’s access log.  
+`konnector logs watchers/config` shows the config watcher log.
 
 ## Commands
 

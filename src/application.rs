@@ -15,6 +15,18 @@ pub fn run() {
     let sites = validation::filter_valid_sites(configs::load_sites_lenient());
     if sites.is_empty() {
         log::warn!("no valid site configs loaded; working page will be used for unmatched hosts");
+    } else {
+        for site in &sites {
+            let source = if site.source_file.is_empty() {
+                site.primary_domain().to_owned()
+            } else {
+                format!("{}.yaml", site.source_file)
+            };
+            log::info!(
+                "loaded site {source} -> {}",
+                site.domains.join(", ")
+            );
+        }
     }
     let root = configs::server();
     if root.root_proxy.is_some() && !root.logging.is_enabled() {

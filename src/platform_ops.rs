@@ -544,14 +544,14 @@ pub fn cmd_status() -> Result<(), String> {
     )
 }
 
-pub fn cmd_logs(follow: bool, lines: &str) -> Result<(), String> {
-    let log_path = paths::log_file();
+pub fn cmd_logs(follow: bool, lines: &str, target: &str) -> Result<(), String> {
+    let log_path = resolve_log_target(target);
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent).ok();
     }
     if !log_path.is_file() {
         println!(
-            "No main log yet at {} (start the service and enable logging).",
+            "No log yet at {} (start the service; site access logs appear after proxied traffic).",
             paths::path_display(&log_path)
         );
         return Ok(());
@@ -589,6 +589,29 @@ pub fn cmd_logs(follow: bool, lines: &str) -> Result<(), String> {
             Err(error) => return Err(format!("cannot read log file: {error}")),
         }
     }
+}
+
+fn resolve_log_target(target: &str) -> PathBuf {
+    let target = target.trim().trim_matches('/');
+    if target.is_empty() || target.eq_ignore_ascii_case("main") {
+        return paths::log_file();
+    }
+    if let Some(watcher) = target
+        .strip_prefix("watchers/")
+        .or_else(|| target.strip_prefix("watcher/"))
+    {
+        return paths::logs_dir()
+            .join("watchers")
+            .join(format!("{watcher}.log"));
+    }
+    if matches!(target, "config" | "tls") {
+        return paths::logs_dir()
+            .join("watchers")
+            .join(format!("{target}.log"));
+    }
+    // YAML stem → logs/{stem}/access.log
+    let stem = target.trim_end_matches(".yaml").trim_end_matches(".yml");
+    paths::logs_dir().join(stem).join("access.log")
 }
 
 #[cfg(unix)]

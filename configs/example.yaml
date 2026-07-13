@@ -1,9 +1,16 @@
-enabled: true
+# Template site config — copy and rename for your domain, then enable.
+#   cp example.yaml mysite.yaml
+#   # edit domains + upstream, then:
+#   enabled: true
+#
+# One HTTP/HTTPS listener (ports from env) serves all site YAMLs by Host.
+# List every apex, subdomain, or a wildcard like *.example.com.
+enabled: false
 
-# Set enabled: false to keep this file but stop serving the site.
 domains:
   - example.com
   - www.example.com
+  - "*.example.com"          # app.example.com, api.example.com, …
 
 proxy:
   mode: direct
@@ -31,7 +38,6 @@ http:
   version: auto
 
 # Request logging for this site (off, error, warn, info, debug).
-# Any level except off logs proxied HTTP requests at INFO. Use debug for upstream and timing details.
-# TCP logging uses the root.yaml default. Omit to inherit the root default.
+# Access lines go to logs/<yaml-stem>/access.log.
 logging:
   level: info

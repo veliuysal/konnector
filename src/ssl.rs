@@ -17,6 +17,16 @@ pub fn proxied_tls_domains(sites: &[SiteConfig]) -> Vec<String> {
     for site in sites {
         for domain in &site.domains {
             let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            if crate::domain_routing::is_wildcard(&normalized) {
+                // Let's Encrypt HTTP-01 cannot issue wildcard certs; skip for ACME SAN list.
+                // Routing still matches *.example.com. Use Cloudflare Origin CA for *. certs,
+                // or list each subdomain explicitly for ACME.
+                log::warn!(
+                    "skipping wildcard {normalized} for certificate issuance; \
+                     list concrete hostnames for Let's Encrypt, or use Cloudflare for *. certs"
+                );
+                continue;
+            }
             if is_tls_dns_name(&normalized) {
                 domains.insert(normalized);
             }
@@ -339,6 +349,18 @@ fn is_tls_dns_name(domain: &str) -> bool {
     {
         return false;
     }
+    // Bundled example.yaml placeholders must not enter ACME / cert checks.
+    if matches!(
+        domain,
+        "example.com"
+            | "www.example.com"
+            | "example.org"
+            | "example.net"
+            | "www.example.org"
+            | "www.example.net"
+    ) {
+        return false;
+    }
     domain.contains('.')
 }
 
@@ -385,6 +407,7 @@ mod tests {
                     "127.0.0.1".to_owned(),
                     "::1".to_owned(),
                     "example.com".to_owned(),
+                    "myapp.com".to_owned(),
                 ],
                 target: crate::configs::ProxyTarget::Direct {
                     upstream: crate::configs::UpstreamConfig {
@@ -408,7 +431,7 @@ mod tests {
                 source_file: "example".to_owned(),
             },
         ];
-        assert_eq!(proxied_tls_domains(&sites), vec!["example.com".to_owned()]);
+        assert_eq!(proxied_tls_domains(&sites), vec!["myapp.com".to_owned()]);
         assert_eq!(
             cloudflare_hostnames(&["example.com".to_owned(), "app.example.com".to_owned()]),
             vec![

@@ -46,6 +46,8 @@ pub enum TlsProviderKind {
 pub struct SiteConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Hostnames this site serves over HTTP/HTTPS (exact or `*.example.com`).
+    #[serde(deserialize_with = "deserialize_domains")]
     pub domains: Vec<String>,
     #[serde(rename = "proxy")]
     pub target: ProxyTarget,
@@ -994,6 +996,22 @@ fn default_redirect_status() -> u16 {
     308
 }
 
+fn deserialize_domains<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DomainsField {
+        One(String),
+        Many(Vec<String>),
+    }
+    match DomainsField::deserialize(deserializer)? {
+        DomainsField::One(value) => Ok(vec![value]),
+        DomainsField::Many(values) => Ok(values),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1200,6 +1218,33 @@ proxy:
 
         let root: RootConfig = serde_yaml::from_str("logging:\n  level: info\n").unwrap();
         assert_eq!(root.logging.level, LogLevel::Info);
+    }
+
+    #[test]
+    fn domains_accept_string_or_list_and_wildcards() {
+        let one: SiteConfig = serde_yaml::from_str(
+            "domains: shop.com\nproxy:\n  mode: direct\n  upstream:\n    instance: 127.0.0.1:3000\n",
+        )
+        .unwrap();
+        assert_eq!(one.domains, vec!["shop.com"]);
+
+        let many: SiteConfig = serde_yaml::from_str(
+            r#"
+domains:
+  - shop.com
+  - www.shop.com
+  - "*.shop.com"
+proxy:
+  mode: direct
+  upstream:
+    instance: 127.0.0.1:3000
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            many.domains,
+            vec!["shop.com", "www.shop.com", "*.shop.com"]
+        );
     }
 
     #[test]

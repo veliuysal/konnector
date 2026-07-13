@@ -129,6 +129,13 @@ fn validate_site(site: &SiteConfig, domains: &mut HashSet<String>) -> Result<(),
         if normalized.is_empty() {
             return Err(format!("{label} has an empty domain"));
         }
+        if let Some(rest) = normalized.strip_prefix("*.") {
+            if rest.is_empty() || !rest.contains('.') || rest.starts_with('.') {
+                return Err(format!(
+                    "{label} has invalid wildcard domain '{domain}' (use *.example.com)"
+                ));
+            }
+        }
         if !domains.insert(normalized.to_ascii_lowercase()) {
             return Err(format!("duplicate domain: {domain}"));
         }
