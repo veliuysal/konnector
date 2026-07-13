@@ -87,14 +87,7 @@ pub fn validate_server(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), 
         return Err("HTTP and HTTPS listeners must be different".into());
     }
     if let Some(root_proxy) = &root.root_proxy {
-        if root_proxy.address.trim().is_empty() {
-            return Err("root proxy upstream must not be empty".into());
-        }
-        if root_proxy.tls && root_proxy.sni.trim().is_empty() {
-            return Err("root TLS proxy requires SNI".into());
-        }
-        validate_upstream_http_version("root proxy", root_proxy)?;
-        validate_ca(root_proxy)?;
+        validate_proxy_target("root proxy", root_proxy)?;
     }
     Ok(())
 }
@@ -177,8 +170,36 @@ fn validate_site(site: &SiteConfig, domains: &mut HashSet<String>) -> Result<(),
         }
     }
 
-    let upstreams: &[UpstreamConfig] = match &site.target {
-        ProxyTarget::Direct { upstream } => std::slice::from_ref(upstream),
+    let upstreams = proxy_target_upstreams(label, &site.target)?;
+    for upstream in upstreams {
+        validate_upstream(site, upstream)?;
+    }
+    if site.cache.enabled && site.cache.max_file_bytes == 0 {
+        return Err(format!("{label} has an invalid cache file limit"));
+    }
+    Ok(())
+}
+
+fn validate_proxy_target(label: &str, target: &ProxyTarget) -> Result<(), String> {
+    for upstream in proxy_target_upstreams(label, target)? {
+        if upstream.address.trim().is_empty() {
+            return Err(format!("{label} has an empty upstream address"));
+        }
+        if upstream.tls && upstream.sni.trim().is_empty() {
+            return Err(format!("{label} has a TLS upstream without SNI"));
+        }
+        validate_upstream_http_version(label, upstream)?;
+        validate_ca(upstream)?;
+    }
+    Ok(())
+}
+
+fn proxy_target_upstreams<'a>(
+    label: &str,
+    target: &'a ProxyTarget,
+) -> Result<&'a [UpstreamConfig], String> {
+    match target {
+        ProxyTarget::Direct { upstream } => Ok(std::slice::from_ref(upstream)),
         ProxyTarget::LoadBalanced {
             upstreams,
             health_check,
@@ -188,18 +209,11 @@ fn validate_site(site: &SiteConfig, domains: &mut HashSet<String>) -> Result<(),
                 return Err(format!("{label} requires at least one upstream"));
             }
             if *health_check && *health_check_interval_seconds == 0 {
-                return Err(format!("{} has an invalid health-check interval", label));
+                return Err(format!("{label} has an invalid health-check interval"));
             }
-            upstreams
+            Ok(upstreams)
         }
-    };
-    for upstream in upstreams {
-        validate_upstream(site, upstream)?;
     }
-    if site.cache.enabled && site.cache.max_file_bytes == 0 {
-        return Err(format!("{label} has an invalid cache file limit"));
-    }
-    Ok(())
 }
 
 fn validate_upstream(site: &SiteConfig, upstream: &UpstreamConfig) -> Result<(), String> {

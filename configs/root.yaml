@@ -13,6 +13,16 @@ logging:
 http:
   version: auto
 
-upstream:
-  instance: 127.0.0.1:3000
-  version: auto
+# Direct (single instance) shorthand:
+# upstream:
+#   instance: 127.0.0.1:3000
+#   version: auto
+
+# Load balance across multiple root upstream instances (same shape as site proxy).
+proxy:
+  mode: load_balanced
+  upstreams:
+    - instance: 127.0.0.1:3000
+    - instance: 127.0.0.1:3001
+  health_check: true
+  health_check_interval_seconds: 5

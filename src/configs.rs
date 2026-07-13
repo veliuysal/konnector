@@ -10,7 +10,7 @@ pub struct ServerConfig {
     pub https_listen: String,
     pub threads: usize,
     pub https: Option<HttpsConfig>,
-    pub root_proxy: Option<UpstreamConfig>,
+    pub root_proxy: Option<ProxyTarget>,
     pub logging: LogLevel,
 }
 
@@ -76,14 +76,7 @@ impl SiteConfig {
 
     pub fn resolve_http_versions(&mut self) {
         let default = self.http.version;
-        match &mut self.target {
-            ProxyTarget::Direct { upstream } => upstream.apply_http_default(default),
-            ProxyTarget::LoadBalanced { upstreams, .. } => {
-                for upstream in upstreams {
-                    upstream.apply_http_default(default);
-                }
-            }
-        }
+        self.target.apply_http_default(default);
         for route in &mut self.internal_routes {
             route.upstream.apply_http_default(default);
         }
@@ -255,6 +248,19 @@ pub enum ProxyTarget {
     },
 }
 
+impl ProxyTarget {
+    pub fn apply_http_default(&mut self, default: HttpVersion) {
+        match self {
+            Self::Direct { upstream } => upstream.apply_http_default(default),
+            Self::LoadBalanced { upstreams, .. } => {
+                for upstream in upstreams {
+                    upstream.apply_http_default(default);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AccessPolicy {
@@ -335,7 +341,7 @@ pub(crate) fn warn_root_file(directory: &Path) {
 
 pub(crate) fn validate_root_file(directory: &Path) -> Result<(), String> {
     let (path, settings) = load_root_settings(directory);
-    if settings.enabled && settings.upstream.is_none() {
+    if settings.enabled && settings.target.is_none() {
         let label = path
             .as_deref()
             .map(|path| path.display().to_string())
@@ -639,8 +645,12 @@ fn normalize_tcp_address(value: &str) -> Result<String, String> {
 struct RootConfig {
     #[serde(default)]
     enabled: bool,
+    /// Shorthand for `proxy: { mode: direct, upstream: ... }`.
     #[serde(default)]
     upstream: Option<UpstreamConfig>,
+    /// Full proxy target (`direct` or `load_balanced`), same shape as site configs.
+    #[serde(default)]
+    proxy: Option<ProxyTarget>,
     #[serde(default)]
     logging: LoggingConfig,
     #[serde(default)]
@@ -650,19 +660,29 @@ struct RootConfig {
 #[derive(Clone, Debug, Default)]
 struct RootSettings {
     enabled: bool,
-    upstream: Option<UpstreamConfig>,
+    target: Option<ProxyTarget>,
     logging: LogLevel,
     http_version: HttpVersion,
 }
 
-impl From<RootConfig> for RootSettings {
-    fn from(config: RootConfig) -> Self {
-        Self {
+impl TryFrom<RootConfig> for RootSettings {
+    type Error = String;
+
+    fn try_from(config: RootConfig) -> Result<Self, Self::Error> {
+        let target = match (config.upstream, config.proxy) {
+            (Some(_), Some(_)) => {
+                return Err("root.yaml cannot set both upstream and proxy".into());
+            }
+            (Some(upstream), None) => Some(ProxyTarget::Direct { upstream }),
+            (None, Some(proxy)) => Some(proxy),
+            (None, None) => None,
+        };
+        Ok(Self {
             enabled: config.enabled,
-            upstream: config.upstream,
+            target,
             logging: config.logging.level,
             http_version: config.http.version,
-        }
+        })
     }
 }
 
@@ -688,7 +708,13 @@ fn load_root_settings(directory: &Path) -> (Option<PathBuf>, RootSettings) {
         return (Some(path), RootSettings::default());
     }
     match serde_yaml::from_str::<RootConfig>(&raw) {
-        Ok(config) => (Some(path), config.into()),
+        Ok(config) => match RootSettings::try_from(config) {
+            Ok(settings) => (Some(path), settings),
+            Err(error) => {
+                log::error!("invalid root config in {}: {error}", path.display());
+                (Some(path), RootSettings::default())
+            }
+        },
         Err(error) => {
             log::error!("invalid YAML in {}: {error}", path.display());
             (Some(path), RootSettings::default())
@@ -696,14 +722,14 @@ fn load_root_settings(directory: &Path) -> (Option<PathBuf>, RootSettings) {
     }
 }
 
-fn root_proxy_from_settings(path: Option<&Path>, settings: &RootSettings) -> Option<UpstreamConfig> {
+fn root_proxy_from_settings(path: Option<&Path>, settings: &RootSettings) -> Option<ProxyTarget> {
     if !settings.enabled {
         return None;
     }
-    match settings.upstream.clone() {
-        Some(mut upstream) => {
-            upstream.apply_http_default(settings.http_version);
-            Some(upstream)
+    match settings.target.clone() {
+        Some(mut target) => {
+            target.apply_http_default(settings.http_version);
+            Some(target)
         }
         None => {
             if let Some(path) = path {
@@ -717,19 +743,21 @@ fn root_proxy_from_settings(path: Option<&Path>, settings: &RootSettings) -> Opt
     }
 }
 
-fn root_proxy_from_env() -> Option<UpstreamConfig> {
+fn root_proxy_from_env() -> Option<ProxyTarget> {
     let address = env::var("ROOT_PROXY").ok()?;
     if address.trim().is_empty() {
         return None;
     }
-    Some(UpstreamConfig {
-        address,
-        tls: env_bool("ROOT_PROXY_TLS", false),
-        sni: env::var("ROOT_PROXY_SNI").unwrap_or_default(),
-        host: env::var("ROOT_PROXY_HOST").ok(),
-        ca_path: env::var("ROOT_PROXY_CA_PATH").ok(),
-        base_path: String::new(),
-        http_version: HttpVersion::Auto,
+    Some(ProxyTarget::Direct {
+        upstream: UpstreamConfig {
+            address,
+            tls: env_bool("ROOT_PROXY_TLS", false),
+            sni: env::var("ROOT_PROXY_SNI").unwrap_or_default(),
+            host: env::var("ROOT_PROXY_HOST").ok(),
+            ca_path: env::var("ROOT_PROXY_CA_PATH").ok(),
+            base_path: String::new(),
+            http_version: HttpVersion::Auto,
+        },
     })
 }
 
@@ -913,7 +941,7 @@ mod tests {
         let (path, settings) = load_root_settings(&temp);
         assert!(path.is_none());
         assert!(!settings.enabled);
-        assert!(settings.upstream.is_none());
+        assert!(settings.target.is_none());
 
         fs::write(temp.join("root.yaml"), "").unwrap();
         let (path, settings) = load_root_settings(&temp);
@@ -932,6 +960,54 @@ mod tests {
         let upstream = serde_yaml::from_str::<RootConfig>("enabled: true\n").unwrap();
         assert!(upstream.enabled);
         assert!(upstream.upstream.is_none());
+        assert!(upstream.proxy.is_none());
+    }
+
+    #[test]
+    fn root_load_balanced_proxy_parses() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+enabled: true
+proxy:
+  mode: load_balanced
+  upstreams:
+    - instance: 127.0.0.1:3000
+    - instance: 127.0.0.1:3001
+  health_check: true
+  health_check_interval_seconds: 5
+"#,
+        )
+        .unwrap();
+        let settings = RootSettings::try_from(root).unwrap();
+        let target = root_proxy_from_settings(None, &settings).unwrap();
+        match target {
+            ProxyTarget::LoadBalanced { upstreams, health_check, health_check_interval_seconds } => {
+                assert_eq!(upstreams.len(), 2);
+                assert_eq!(upstreams[0].address, "127.0.0.1:3000");
+                assert_eq!(upstreams[1].address, "127.0.0.1:3001");
+                assert!(health_check);
+                assert_eq!(health_check_interval_seconds, 5);
+            }
+            ProxyTarget::Direct { .. } => panic!("expected load_balanced root proxy"),
+        }
+    }
+
+    #[test]
+    fn root_rejects_both_upstream_and_proxy() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+enabled: true
+upstream:
+  instance: 127.0.0.1:3000
+proxy:
+  mode: direct
+  upstream:
+    instance: 127.0.0.1:3001
+"#,
+        )
+        .unwrap();
+        let error = RootSettings::try_from(root).unwrap_err();
+        assert!(error.contains("both upstream and proxy"));
     }
 
     #[test]
@@ -1051,8 +1127,13 @@ mod tests {
             "enabled: true\nhttp:\n  version: \"1.1\"\nupstream:\n  instance: localhost\n",
         )
         .unwrap();
-        let settings: RootSettings = root.into();
-        let upstream = root_proxy_from_settings(None, &settings).unwrap();
-        assert_eq!(upstream.http_version, HttpVersion::Http11);
+        let settings = RootSettings::try_from(root).unwrap();
+        let target = root_proxy_from_settings(None, &settings).unwrap();
+        match target {
+            ProxyTarget::Direct { upstream } => {
+                assert_eq!(upstream.http_version, HttpVersion::Http11);
+            }
+            ProxyTarget::LoadBalanced { .. } => panic!("expected direct root proxy"),
+        }
     }
 }

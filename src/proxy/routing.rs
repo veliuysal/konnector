@@ -1,6 +1,6 @@
 use super::{SiteRuntime, UpstreamRuntime};
 use crate::{
-    configs::{self, AccessPolicy, CacheConfig, ForwardingConfig, LogLevel, ProxyTarget, SiteConfig, UpstreamConfig},
+    configs::{self, AccessPolicy, CacheConfig, ForwardingConfig, LogLevel, ProxyTarget, SiteConfig},
     upstreams, validation,
 };
 use pingora::{cache::MemCache, prelude::*};
@@ -24,7 +24,7 @@ pub fn snapshot(routing: &SharedRouting) -> Arc<ProxyRouting> {
 
 pub fn build_proxy_routing(
     site_configs: Vec<SiteConfig>,
-    root_proxy: Option<UpstreamConfig>,
+    root_proxy: Option<ProxyTarget>,
     default_logging: LogLevel,
     mut server: Option<&mut Server>,
 ) -> ProxyRouting {
@@ -32,39 +32,11 @@ pub fn build_proxy_routing(
     for site in site_configs {
         let primary_domain = site.primary_domain().to_owned();
         let logging = site.resolved_logging(default_logging);
-        let target = match site.target {
-            ProxyTarget::Direct { upstream } => UpstreamRuntime::Direct(upstream),
-            ProxyTarget::LoadBalanced {
-                upstreams: pool,
-                health_check,
-                health_check_interval_seconds,
-            } => {
-                let load_balancer = upstreams::create_load_balancer(
-                    &primary_domain,
-                    &pool,
-                    health_check,
-                    health_check_interval_seconds,
-                );
-                match &mut server {
-                    Some(server) => {
-                        let background = background_service(
-                            &format!("{primary_domain} health check"),
-                            load_balancer,
-                        );
-                        let runtime = UpstreamRuntime::LoadBalanced {
-                            upstreams: pool,
-                            load_balancer: background.task(),
-                        };
-                        server.add_service(background);
-                        runtime
-                    }
-                    None => UpstreamRuntime::LoadBalanced {
-                        upstreams: pool,
-                        load_balancer: Arc::new(load_balancer),
-                    },
-                }
-            }
-        };
+        let target = upstream_runtime_from_target(
+            &primary_domain,
+            site.target,
+            server.as_deref_mut(),
+        );
         sites.push(SiteRuntime {
             domains: site.domains,
             target,
@@ -80,9 +52,10 @@ pub fn build_proxy_routing(
 
     let root_site = root_proxy.map(|root_proxy| {
         let index = sites.len();
+        let target = upstream_runtime_from_target("root", root_proxy, server.as_deref_mut());
         sites.push(SiteRuntime {
             domains: Vec::new(),
-            target: UpstreamRuntime::Direct(root_proxy),
+            target,
             internal_routes: Vec::new(),
             redirects: Vec::new(),
             access: AccessPolicy::All,
@@ -101,6 +74,44 @@ pub fn build_proxy_routing(
         sites,
         root_site,
         default_logging,
+    }
+}
+
+fn upstream_runtime_from_target(
+    name: &str,
+    target: ProxyTarget,
+    server: Option<&mut Server>,
+) -> UpstreamRuntime {
+    match target {
+        ProxyTarget::Direct { upstream } => UpstreamRuntime::Direct(upstream),
+        ProxyTarget::LoadBalanced {
+            upstreams: pool,
+            health_check,
+            health_check_interval_seconds,
+        } => {
+            let load_balancer = upstreams::create_load_balancer(
+                name,
+                &pool,
+                health_check,
+                health_check_interval_seconds,
+            );
+            match server {
+                Some(server) => {
+                    let background =
+                        background_service(&format!("{name} health check"), load_balancer);
+                    let runtime = UpstreamRuntime::LoadBalanced {
+                        upstreams: pool,
+                        load_balancer: background.task(),
+                    };
+                    server.add_service(background);
+                    runtime
+                }
+                None => UpstreamRuntime::LoadBalanced {
+                    upstreams: pool,
+                    load_balancer: Arc::new(load_balancer),
+                },
+            }
+        }
     }
 }
 
