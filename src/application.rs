@@ -122,7 +122,8 @@ fn init_logging() {
         .format(|buf, record| {
             writeln!(
                 buf,
-                "[{} konnector] {}",
+                "{} [{} konnector] {}",
+                crate::platform_ops::log_timestamp(),
                 record.level(),
                 record.args()
             )?;

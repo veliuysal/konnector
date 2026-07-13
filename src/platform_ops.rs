@@ -69,6 +69,16 @@ pub fn utc_timestamp() -> String {
     format!("{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}")
 }
 
+/// RFC3339-style UTC timestamp for log lines (`2026-07-13T16:03:45Z`).
+pub fn log_timestamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or(0);
+    let (year, month, day, hour, minute, second) = civil_datetime_utc(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 pub fn short_hash(value: &str) -> String {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);

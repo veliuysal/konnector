@@ -1,4 +1,4 @@
-use crate::paths;
+use crate::{paths, platform_ops};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -106,7 +106,10 @@ pub fn write_watcher(watcher: &str, line: &str) {
 }
 
 pub fn format_line(level: &str, message: &str) -> String {
-    format!("[{level} konnector] {message}")
+    format!(
+        "{} [{level} konnector] {message}",
+        platform_ops::log_timestamp()
+    )
 }
 
 fn log_line(folder: &str, file: &str, message: &str) {
