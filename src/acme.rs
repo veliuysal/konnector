@@ -39,10 +39,6 @@ pub fn challenge_response(token: &str) -> Option<String> {
         .cloned()
 }
 
-pub fn is_challenge_path(path: &str) -> bool {
-    path.starts_with(ACME_CHALLENGE_PREFIX)
-}
-
 pub fn challenge_token_from_path(path: &str) -> Option<&str> {
     path.strip_prefix(ACME_CHALLENGE_PREFIX)
         .filter(|token| !token.is_empty() && !token.contains('/'))
@@ -383,7 +379,6 @@ mod tests {
 
     #[test]
     fn parses_challenge_paths() {
-        assert!(is_challenge_path("/.well-known/acme-challenge/abc"));
         assert_eq!(
             challenge_token_from_path("/.well-known/acme-challenge/abc"),
             Some("abc")
@@ -392,6 +387,10 @@ mod tests {
             challenge_token_from_path("/.well-known/acme-challenge/a/b"),
             None
         );
-        assert!(!is_challenge_path("/health"));
+        assert_eq!(challenge_token_from_path("/health"), None);
+        assert_eq!(
+            challenge_token_from_path("/.well-known/acme-challenge/"),
+            None
+        );
     }
 }
