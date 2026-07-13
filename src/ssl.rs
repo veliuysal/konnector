@@ -15,6 +15,9 @@ const DEFAULT_ORIGIN_VALIDITY_DAYS: u32 = 5475;
 pub fn proxied_tls_domains(sites: &[SiteConfig]) -> Vec<String> {
     let mut domains = HashSet::new();
     for site in sites {
+        if !site.listen.https {
+            continue;
+        }
         for domain in &site.domains {
             let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
             if crate::domain_routing::is_wildcard(&normalized) {
@@ -427,6 +430,9 @@ mod tests {
                 forwarding: crate::configs::ForwardingConfig::Cloudflare,
                 logging: None,
                 http: crate::configs::HttpSettings::default(),
+                listen: crate::configs::ListenMode::both(),
+                traffic: crate::configs::TrafficMode::default(),
+                redirect_https: false,
                 enabled: true,
                 source_file: "example".to_owned(),
             },

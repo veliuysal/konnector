@@ -26,6 +26,7 @@ mod ssl_watcher;
 mod tcp_proxy;
 mod upstreams;
 mod validation;
+mod websocket;
 
 #[cfg(windows)]
 mod windows_svc;

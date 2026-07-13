@@ -2,11 +2,15 @@ use crate::configs::{
     AccessPolicy, HttpVersion, ProxyTarget, RedirectMatch, ServerConfig, SiteConfig,
     TcpProxyConfig, UpstreamConfig,
 };
+use crate::domain_routing::DomainClaim;
 use crate::ssl;
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 pub fn filter_valid_sites(sites: Vec<SiteConfig>) -> Vec<SiteConfig> {
-    let mut domains = HashSet::new();
+    let mut domains: HashMap<String, DomainClaim> = HashMap::new();
     let mut valid = Vec::new();
     for site in sites {
         if !site.enabled {
@@ -112,16 +116,31 @@ pub fn validate(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), String>
     if sites.is_empty() {
         return Err("at least one site config is required".into());
     }
-    let mut domains = HashSet::new();
+    let mut domains: HashMap<String, DomainClaim> = HashMap::new();
     for site in sites {
         validate_site(site, &mut domains)?;
     }
     Ok(())
 }
 
-fn validate_site(site: &SiteConfig, domains: &mut HashSet<String>) -> Result<(), String> {
+fn validate_site(
+    site: &SiteConfig,
+    domains: &mut HashMap<String, DomainClaim>,
+) -> Result<(), String> {
     if site.domains.is_empty() {
         return Err("site domains must not be empty".into());
+    }
+    if !site.listen.http && !site.listen.https {
+        return Err(format!(
+            "{} listen must enable http and/or https",
+            site.primary_domain()
+        ));
+    }
+    if !site.traffic.http && !site.traffic.websocket {
+        return Err(format!(
+            "{} traffic must enable http and/or websocket",
+            site.primary_domain()
+        ));
     }
     let label = site.primary_domain();
     for domain in &site.domains {
@@ -136,8 +155,14 @@ fn validate_site(site: &SiteConfig, domains: &mut HashSet<String>) -> Result<(),
                 ));
             }
         }
-        if !domains.insert(normalized.to_ascii_lowercase()) {
-            return Err(format!("duplicate domain: {domain}"));
+        let key = normalized.to_ascii_lowercase();
+        let claim = domains.entry(key).or_default();
+        if let Err(detail) = claim.claim(site.listen, site.traffic) {
+            return Err(format!(
+                "duplicate domain for {detail}: {domain} (listen={} traffic={})",
+                site.listen.label(),
+                site.traffic.label()
+            ));
         }
     }
     if let AccessPolicy::OnlyPrefixes { prefixes } = &site.access {
@@ -197,6 +222,16 @@ fn validate_site(site: &SiteConfig, domains: &mut HashSet<String>) -> Result<(),
     }
     if site.cache.enabled && site.cache.max_file_bytes == 0 {
         return Err(format!("{label} has an invalid cache file limit"));
+    }
+    if site.redirect_https && !site.listen.http {
+        return Err(format!(
+            "{label} redirect_https requires listen to include http (use listen: both)"
+        ));
+    }
+    if site.redirect_https && !site.listen.https {
+        log::warn!(
+            "{label} redirect_https is set but listen has no https; ensure another site or TLS covers this host"
+        );
     }
     Ok(())
 }
@@ -282,7 +317,8 @@ fn validate_ca(upstream: &UpstreamConfig) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::configs;
-    use std::collections::HashSet;
+    use crate::configs::{ListenMode, TrafficMode};
+    use std::collections::HashMap;
 
     #[test]
     fn rust_configuration_is_valid() {
@@ -318,7 +354,7 @@ mod tests {
             "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n    version: \"2\"\n",
         )
         .unwrap();
-        let mut domains = HashSet::new();
+        let mut domains = HashMap::new();
         let error = validate_site(&site, &mut domains).unwrap_err();
         assert!(error.contains("HTTP/2"));
     }
@@ -329,8 +365,100 @@ mod tests {
             "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n    version: \"3\"\n",
         )
         .unwrap();
-        let mut domains = HashSet::new();
+        let mut domains = HashMap::new();
         let error = validate_site(&site, &mut domains).unwrap_err();
         assert!(error.contains("HTTP/3"));
+    }
+
+    #[test]
+    fn traffic_defaults_to_http_only() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n",
+        )
+        .unwrap();
+        assert_eq!(site.traffic, TrafficMode::http_only());
+        assert_eq!(site.listen, ListenMode::http_only());
+    }
+
+    #[test]
+    fn same_domain_allowed_for_http_and_https_listen() {
+        let plain: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nlisten: http\nproxy:\n  mode: direct\n  upstream:\n    instance: 127.0.0.1:8080\n",
+        )
+        .unwrap();
+        let tls: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nlisten: https\nproxy:\n  mode: direct\n  upstream:\n    instance: 127.0.0.1:8081\n",
+        )
+        .unwrap();
+        let mut domains = HashMap::new();
+        validate_site(&plain, &mut domains).unwrap();
+        validate_site(&tls, &mut domains).unwrap();
+    }
+
+    #[test]
+    fn listen_aliases_parse() {
+        let by_port: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nlisten: 443\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n",
+        )
+        .unwrap();
+        assert_eq!(by_port.listen, ListenMode::https_only());
+        let both: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nlisten: both\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n",
+        )
+        .unwrap();
+        assert_eq!(both.listen, ListenMode::both());
+    }
+
+    #[test]
+    fn same_domain_allowed_for_http_and_websocket_sites() {
+        let http: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\ntraffic: http\nproxy:\n  mode: direct\n  upstream:\n    instance: 127.0.0.1:8080\n",
+        )
+        .unwrap();
+        let ws: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\ntraffic: websocket\nproxy:\n  mode: direct\n  upstream:\n    instance: 127.0.0.1:8081\n",
+        )
+        .unwrap();
+        let mut domains = HashMap::new();
+        validate_site(&http, &mut domains).unwrap();
+        validate_site(&ws, &mut domains).unwrap();
+    }
+
+    #[test]
+    fn overlapping_http_traffic_is_rejected() {
+        let a: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nproxy:\n  mode: direct\n  upstream:\n    instance: 127.0.0.1:8080\n",
+        )
+        .unwrap();
+        let b: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\ntraffic: both\nproxy:\n  mode: direct\n  upstream:\n    instance: 127.0.0.1:8081\n",
+        )
+        .unwrap();
+        let mut domains = HashMap::new();
+        validate_site(&a, &mut domains).unwrap();
+        let error = validate_site(&b, &mut domains).unwrap_err();
+        assert!(error.contains("duplicate domain for http traffic on http listen"));
+    }
+
+    #[test]
+    fn redirect_https_requires_http_listen() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nlisten: https\nredirect_https: true\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n",
+        )
+        .unwrap();
+        let mut domains = HashMap::new();
+        let error = validate_site(&site, &mut domains).unwrap_err();
+        assert!(error.contains("redirect_https requires listen"));
+    }
+
+    #[test]
+    fn redirect_https_allowed_with_both_listen() {
+        let site: SiteConfig = serde_yaml::from_str(
+            "domains: [example.com]\nlisten: both\nredirect_https: true\nproxy:\n  mode: direct\n  upstream:\n    instance: localhost\n",
+        )
+        .unwrap();
+        let mut domains = HashMap::new();
+        validate_site(&site, &mut domains).unwrap();
+        assert!(site.redirect_https);
     }
 }

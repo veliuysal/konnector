@@ -86,6 +86,7 @@ pub fn log_request(
     let summary = session.as_ref().request_summary();
     let http_version = upstream_http_version(ctx, sites);
     let site_name = site_log_name(ctx, sites, root_site);
+    let ws = if ctx.websocket { " websocket=true" } else { "" };
 
     if level.is_debug() {
         let upstream = upstream_summary(ctx, sites);
@@ -95,11 +96,11 @@ pub fn log_request(
             .unwrap_or(0);
         let message = if let Some(error) = error {
             format!(
-                "{summary} -> {status} ({duration_ms}ms) upstream={upstream} http={http_version} error={error}"
+                "{summary} -> {status} ({duration_ms}ms) upstream={upstream} http={http_version}{ws} error={error}"
             )
         } else {
             format!(
-                "{summary} -> {status} ({duration_ms}ms) upstream={upstream} http={http_version}"
+                "{summary} -> {status} ({duration_ms}ms) upstream={upstream} http={http_version}{ws}"
             )
         };
         emit_access(&site_name, &message);
@@ -107,9 +108,9 @@ pub fn log_request(
     }
 
     let message = if let Some(error) = error {
-        format!("{summary} -> {status} http={http_version} error={error}")
+        format!("{summary} -> {status} http={http_version}{ws} error={error}")
     } else {
-        format!("{summary} -> {status} http={http_version}")
+        format!("{summary} -> {status} http={http_version}{ws}")
     };
     emit_access(&site_name, &message);
 }
@@ -132,9 +133,10 @@ pub fn log_proxy_started(
     let upstream = upstream_summary(ctx, sites);
     let http_version = upstream_http_version(ctx, sites);
     let site_name = site_log_name(ctx, sites, root_site);
+    let ws = if ctx.websocket { " websocket=true" } else { "" };
     emit_access(
         &site_name,
-        &format!("{summary} proxy upstream={upstream} http={http_version}"),
+        &format!("{summary} proxy upstream={upstream} http={http_version}{ws}"),
     );
 }
 
@@ -225,6 +227,9 @@ mod tests {
             cache_storage: Box::leak(Box::new(pingora::cache::MemCache::new())),
             forwarding: Default::default(),
             logging: LogLevel::Off,
+            listen: crate::configs::ListenMode::both(),
+            traffic: crate::configs::TrafficMode::both(),
+            redirect_https: false,
             source_file: "root".to_owned(),
         }];
         let ctx = RequestContext {
@@ -289,6 +294,9 @@ mod tests {
             cache_storage: Box::leak(Box::new(pingora::cache::MemCache::new())),
             forwarding: Default::default(),
             logging: LogLevel::Info,
+            listen: crate::configs::ListenMode::default(),
+            traffic: crate::configs::TrafficMode::default(),
+            redirect_https: false,
             source_file: "example".to_owned(),
         }];
         let ctx = RequestContext {

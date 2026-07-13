@@ -1,21 +1,49 @@
-use crate::proxy::SiteRuntime;
+use crate::{
+    configs::{ListenMode, TrafficMode},
+    proxy::SiteRuntime,
+    websocket,
+};
 use pingora::prelude::Session;
 
 pub fn site_for(session: &Session, sites: &[SiteRuntime]) -> Option<usize> {
     let host = request_host(session)?;
+    let want_https = session_is_https(session);
+    let want_websocket = websocket::is_upgrade_request(session);
     // Prefer exact domain matches over wildcards when several sites could apply.
     if let Some(index) = sites.iter().position(|site| {
-        site.domains
-            .iter()
-            .any(|domain| host_matches(domain, host) && !is_wildcard(domain))
+        site_matches(site, host, want_https, want_websocket, true)
     }) {
         return Some(index);
     }
-    sites.iter().position(|site| {
-        site.domains
-            .iter()
-            .any(|domain| host_matches(domain, host))
+    sites
+        .iter()
+        .position(|site| site_matches(site, host, want_https, want_websocket, false))
+}
+
+fn site_matches(
+    site: &SiteRuntime,
+    host: &str,
+    want_https: bool,
+    want_websocket: bool,
+    exact_only: bool,
+) -> bool {
+    if !site.listen.accepts(want_https) || !site.traffic.accepts(want_websocket) {
+        return false;
+    }
+    site.domains.iter().any(|domain| {
+        if exact_only && is_wildcard(domain) {
+            return false;
+        }
+        host_matches(domain, host)
     })
+}
+
+pub fn session_is_https(session: &Session) -> bool {
+    session
+        .as_downstream()
+        .digest()
+        .and_then(|digest| digest.ssl_digest.as_ref())
+        .is_some()
 }
 
 fn request_host(session: &Session) -> Option<&str> {
@@ -55,7 +83,6 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
     !left.is_empty() && !left.contains('.')
 }
 
-
 pub fn is_wildcard(domain: &str) -> bool {
     normalize_host(domain).starts_with("*.")
 }
@@ -72,6 +99,49 @@ pub fn normalize_host(authority: &str) -> &str {
             host
         }
         _ => authority,
+    }
+}
+
+/// Track domain claims so sites may share a hostname when listen/traffic modes do not overlap.
+#[derive(Clone, Copy, Default)]
+pub struct DomainClaim {
+    plain: ProtocolClaim,
+    tls: ProtocolClaim,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProtocolClaim {
+    http: bool,
+    websocket: bool,
+}
+
+impl ProtocolClaim {
+    fn claim(&mut self, traffic: TrafficMode) -> Result<(), &'static str> {
+        if traffic.http && self.http {
+            return Err("http");
+        }
+        if traffic.websocket && self.websocket {
+            return Err("websocket");
+        }
+        self.http |= traffic.http;
+        self.websocket |= traffic.websocket;
+        Ok(())
+    }
+}
+
+impl DomainClaim {
+    pub fn claim(&mut self, listen: ListenMode, traffic: TrafficMode) -> Result<(), String> {
+        if listen.http {
+            self.plain.claim(traffic).map_err(|kind| {
+                format!("{kind} traffic on http listen")
+            })?;
+        }
+        if listen.https {
+            self.tls.claim(traffic).map_err(|kind| {
+                format!("{kind} traffic on https listen")
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -97,8 +167,24 @@ mod tests {
 
     #[test]
     fn exact_beats_wildcard_semantics() {
-        // api.shop.com should prefer an exact site entry over *.shop.com on another site.
         assert!(host_matches("api.shop.com", "api.shop.com"));
         assert!(host_matches("*.shop.com", "api.shop.com"));
+    }
+
+    #[test]
+    fn domain_claims_allow_split_listen_and_traffic() {
+        let mut claim = DomainClaim::default();
+        assert!(claim
+            .claim(ListenMode::http_only(), TrafficMode::http_only())
+            .is_ok());
+        assert!(claim
+            .claim(ListenMode::https_only(), TrafficMode::http_only())
+            .is_ok());
+        assert!(claim
+            .claim(ListenMode::http_only(), TrafficMode::websocket_only())
+            .is_ok());
+        assert!(claim
+            .claim(ListenMode::http_only(), TrafficMode::http_only())
+            .is_err());
     }
 }

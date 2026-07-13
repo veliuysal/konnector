@@ -1,7 +1,7 @@
 use crate::{
     configs::{
-        AccessPolicy, CacheConfig, ForwardingConfig, InternalRouteConfig, LogLevel, RedirectRule,
-        UpstreamConfig,
+        AccessPolicy, CacheConfig, ForwardingConfig, InternalRouteConfig, ListenMode, LogLevel,
+        RedirectRule, TrafficMode, UpstreamConfig,
     },
     path_rewrite::PathRewriteState,
 };
@@ -21,6 +21,9 @@ pub struct SiteRuntime {
     pub cache_storage: &'static MemCache,
     pub forwarding: ForwardingConfig,
     pub logging: LogLevel,
+    pub listen: ListenMode,
+    pub traffic: TrafficMode,
+    pub redirect_https: bool,
     /// YAML config stem used for `logs/{source_file}/access.log`.
     pub source_file: String,
 }
@@ -59,5 +62,6 @@ pub struct RequestContext {
     pub path_rewrite: Option<PathRewriteState>,
     pub skip_access_log: bool,
     pub proxied: bool,
+    pub websocket: bool,
     pub started_at: Option<std::time::Instant>,
 }

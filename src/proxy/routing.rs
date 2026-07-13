@@ -1,6 +1,9 @@
 use super::{SiteRuntime, UpstreamRuntime};
 use crate::{
-    configs::{self, AccessPolicy, CacheConfig, ForwardingConfig, LogLevel, ProxyTarget, SiteConfig},
+    configs::{
+        self, AccessPolicy, CacheConfig, ForwardingConfig, ListenMode, LogLevel, ProxyTarget,
+        SiteConfig, TrafficMode,
+    },
     upstreams, validation,
 };
 use pingora::{cache::MemCache, prelude::*};
@@ -32,6 +35,8 @@ pub fn build_proxy_routing(
     for site in site_configs {
         let primary_domain = site.primary_domain().to_owned();
         let logging = site.resolved_logging(default_logging);
+        let listen = site.listen;
+        let traffic = site.traffic;
         let target = upstream_runtime_from_target(
             &primary_domain,
             site.target,
@@ -47,6 +52,9 @@ pub fn build_proxy_routing(
             cache_storage: Box::leak(Box::new(MemCache::new())),
             forwarding: site.forwarding,
             logging,
+            listen,
+            traffic,
+            redirect_https: site.redirect_https,
             source_file: if site.source_file.is_empty() {
                 primary_domain.clone()
             } else {
@@ -71,6 +79,10 @@ pub fn build_proxy_routing(
             cache_storage: Box::leak(Box::new(MemCache::new())),
             forwarding: ForwardingConfig::Direct,
             logging: default_logging,
+            // Root fallback accepts both listeners and both traffic kinds.
+            listen: ListenMode::both(),
+            traffic: TrafficMode::both(),
+            redirect_https: false,
             source_file: "root".to_owned(),
         });
         index

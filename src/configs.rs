@@ -49,12 +49,24 @@ pub struct SiteConfig {
     /// Hostnames this site serves over HTTP/HTTPS (exact or `*.example.com`).
     #[serde(deserialize_with = "deserialize_domains")]
     pub domains: Vec<String>,
+    /// Listener this site answers on: `http` (default), `https`, or `both`.
+    /// Same hostname can be split across YAMLs (e.g. one `listen: http`, one `listen: https`).
+    #[serde(default, deserialize_with = "deserialize_listen")]
+    pub listen: ListenMode,
+    /// What this site accepts: `http` (default), `websocket`/`ws`, or `both`.
+    /// Same hostname can appear on two YAMLs if one is http-only and the other websocket-only.
+    #[serde(default, deserialize_with = "deserialize_traffic")]
+    pub traffic: TrafficMode,
     #[serde(rename = "proxy")]
     pub target: ProxyTarget,
     #[serde(default)]
     pub internal_routes: Vec<InternalRouteConfig>,
     #[serde(default)]
     pub redirects: Vec<RedirectRule>,
+    /// When true, plain HTTP requests get a 308 to the HTTPS URL (same host/path/query).
+    /// Use with `listen: both` (or a separate https site for the same host).
+    #[serde(default)]
+    pub redirect_https: bool,
     #[serde(default)]
     pub access: AccessPolicy,
     #[serde(default)]
@@ -95,6 +107,113 @@ impl SiteConfig {
         self.target.apply_http_default(default);
         for route in &mut self.internal_routes {
             route.upstream.apply_http_default(default);
+        }
+    }
+}
+
+/// Which server listener(s) a site YAML answers on (plain HTTP vs TLS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenMode {
+    pub http: bool,
+    pub https: bool,
+}
+
+impl Default for ListenMode {
+    fn default() -> Self {
+        Self::http_only()
+    }
+}
+
+impl ListenMode {
+    pub fn http_only() -> Self {
+        Self {
+            http: true,
+            https: false,
+        }
+    }
+
+    pub fn https_only() -> Self {
+        Self {
+            http: false,
+            https: true,
+        }
+    }
+
+    pub fn both() -> Self {
+        Self {
+            http: true,
+            https: true,
+        }
+    }
+
+    pub fn accepts(self, https: bool) -> bool {
+        if https {
+            self.https
+        } else {
+            self.http
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match (self.http, self.https) {
+            (true, true) => "both",
+            (true, false) => "http",
+            (false, true) => "https",
+            (false, false) => "none",
+        }
+    }
+}
+
+/// Which request kinds a site YAML handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrafficMode {
+    pub http: bool,
+    pub websocket: bool,
+}
+
+impl Default for TrafficMode {
+    fn default() -> Self {
+        // Default sites serve regular request traffic only. Enable websocket explicitly.
+        Self::http_only()
+    }
+}
+
+impl TrafficMode {
+    pub fn http_only() -> Self {
+        Self {
+            http: true,
+            websocket: false,
+        }
+    }
+
+    pub fn websocket_only() -> Self {
+        Self {
+            http: false,
+            websocket: true,
+        }
+    }
+
+    pub fn both() -> Self {
+        Self {
+            http: true,
+            websocket: true,
+        }
+    }
+
+    pub fn accepts(self, websocket: bool) -> bool {
+        if websocket {
+            self.websocket
+        } else {
+            self.http
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match (self.http, self.websocket) {
+            (true, true) => "both",
+            (true, false) => "http",
+            (false, true) => "websocket",
+            (false, false) => "none",
         }
     }
 }
@@ -1014,6 +1133,137 @@ where
     match DomainsField::deserialize(deserializer)? {
         DomainsField::One(value) => Ok(vec![value]),
         DomainsField::Many(values) => Ok(values),
+    }
+}
+
+fn deserialize_listen<'de, D>(deserializer: D) -> Result<ListenMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ListenField {
+        Name(String),
+        Port(u64),
+        List(Vec<String>),
+        Object {
+            #[serde(default)]
+            http: bool,
+            #[serde(default)]
+            https: bool,
+        },
+    }
+
+    fn parse_token(value: &str) -> Result<(bool, bool), String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "both" | "all" => Ok((true, true)),
+            "http" | "80" => Ok((true, false)),
+            "https" | "443" => Ok((false, true)),
+            other => Err(format!(
+                "invalid listen value '{other}' (use http, https, 80, 443, or both)"
+            )),
+        }
+    }
+
+    match ListenField::deserialize(deserializer)? {
+        ListenField::Name(name) => {
+            let (http, https) = parse_token(&name).map_err(de::Error::custom)?;
+            Ok(ListenMode { http, https })
+        }
+        ListenField::Port(port) => {
+            let (http, https) = match port {
+                80 => (true, false),
+                443 => (false, true),
+                other => {
+                    return Err(de::Error::custom(format!(
+                        "invalid listen port {other} (use 80, 443, http, https, or both)"
+                    )));
+                }
+            };
+            Ok(ListenMode { http, https })
+        }
+        ListenField::List(items) => {
+            let mut http = false;
+            let mut https = false;
+            for item in items {
+                let (h, s) = parse_token(&item).map_err(de::Error::custom)?;
+                http |= h;
+                https |= s;
+            }
+            if !http && !https {
+                return Err(de::Error::custom(
+                    "listen list must include http and/or https",
+                ));
+            }
+            Ok(ListenMode { http, https })
+        }
+        ListenField::Object { http, https } => {
+            if !http && !https {
+                return Err(de::Error::custom(
+                    "listen must enable http and/or https",
+                ));
+            }
+            Ok(ListenMode { http, https })
+        }
+    }
+}
+
+fn deserialize_traffic<'de, D>(deserializer: D) -> Result<TrafficMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TrafficField {
+        Name(String),
+        List(Vec<String>),
+        Object {
+            #[serde(default)]
+            http: bool,
+            #[serde(default)]
+            websocket: bool,
+        },
+    }
+
+    fn parse_token(value: &str) -> Result<(bool, bool), String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "both" | "all" => Ok((true, true)),
+            "http" | "website" | "web" => Ok((true, false)),
+            "websocket" | "websockets" | "ws" | "wss" => Ok((false, true)),
+            other => Err(format!(
+                "invalid traffic value '{other}' (use http, websocket/ws, or both)"
+            )),
+        }
+    }
+
+    match TrafficField::deserialize(deserializer)? {
+        TrafficField::Name(name) => {
+            let (http, websocket) = parse_token(&name).map_err(de::Error::custom)?;
+            Ok(TrafficMode { http, websocket })
+        }
+        TrafficField::List(items) => {
+            let mut http = false;
+            let mut websocket = false;
+            for item in items {
+                let (h, w) = parse_token(&item).map_err(de::Error::custom)?;
+                http |= h;
+                websocket |= w;
+            }
+            if !http && !websocket {
+                return Err(de::Error::custom(
+                    "traffic list must include http and/or websocket",
+                ));
+            }
+            Ok(TrafficMode { http, websocket })
+        }
+        TrafficField::Object { http, websocket } => {
+            if !http && !websocket {
+                return Err(de::Error::custom(
+                    "traffic must enable http and/or websocket",
+                ));
+            }
+            Ok(TrafficMode { http, websocket })
+        }
     }
 }
 

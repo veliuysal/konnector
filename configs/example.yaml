@@ -4,7 +4,9 @@
 #   enabled: true
 #
 # One HTTP/HTTPS listener (ports from env) serves all site YAMLs by Host.
-# List every apex, subdomain, or a wildcard like *.example.com.
+# listen: http (default) | https | both — which listener this site answers on.
+# traffic: http (default) | websocket | both — request kinds.
+# Same hostname can be split across YAMLs by listen and/or traffic.
 enabled: false
 
 domains:
@@ -12,10 +14,29 @@ domains:
   - www.example.com
   - "*.example.com"          # app.example.com, api.example.com, …
 
+# http (default) | https | both  (aliases: 80, 443)
+listen: both
+
+# Redirect plain HTTP → HTTPS (308). Requires listen that includes http.
+redirect_https: true
+
+# http (default) | websocket | both
+# traffic: http
+
+# Single upstream:
 proxy:
   mode: direct
   upstream:
     instance: 127.0.0.1:8080
+
+# Or multiple instances (load-balanced):
+# proxy:
+#   mode: load_balanced
+#   upstreams:
+#     - instance: 127.0.0.1:8080
+#     - instance: 127.0.0.1:8081
+#   health_check: true
+#   health_check_interval_seconds: 5
 
 redirects:
   - from: /home
@@ -33,11 +54,10 @@ cache:
 
 forwarding: direct
 
-# Upstream HTTP protocol version (1.1, 2, 3, auto). HTTP/2 and HTTP/3 require TLS.
+# Upstream HTTP protocol version (1.1, 2, 3, auto).
+# WebSocket upgrades always use HTTP/1.1 to the upstream.
 http:
   version: auto
 
-# Request logging for this site (off, error, warn, info, debug).
-# Access lines go to logs/<yaml-stem>/access.log.
 logging:
   level: info

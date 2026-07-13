@@ -41,7 +41,7 @@ pub async fn select_peer(
         upstream.tls,
         upstream.sni.clone(),
     );
-    configure_peer(peer, upstream)
+    configure_peer(peer, upstream, ctx.websocket)
 }
 
 pub fn resolve_upstream_selection<'a>(
@@ -64,8 +64,15 @@ pub fn resolve_upstream_selection<'a>(
             upstreams,
             load_balancer,
         } => {
+            // Sticky-ish pick for WebSocket: hash client path so reconnects prefer
+            // a stable instance when multiple upstreams are healthy.
+            let hash_key = if ctx.websocket {
+                path.as_bytes()
+            } else {
+                b""
+            };
             let backend = load_balancer
-                .select(b"", 256)
+                .select(hash_key, 256)
                 .ok_or_else(|| Error::explain(ErrorType::HTTPStatus(503), "no healthy upstream"))?;
             let address = backend.addr.to_string();
             let upstream_index = upstreams
@@ -83,9 +90,20 @@ pub fn resolve_upstream_selection<'a>(
     }
 }
 
-fn configure_peer(mut peer: HttpPeer, upstream: &UpstreamConfig) -> Result<Box<HttpPeer>> {
-    peer.options.idle_timeout = Some(UPSTREAM_IDLE_TIMEOUT);
-    peer.options.alpn = upstream.http_version.to_alpn(upstream.tls);
+fn configure_peer(
+    mut peer: HttpPeer,
+    upstream: &UpstreamConfig,
+    websocket: bool,
+) -> Result<Box<HttpPeer>> {
+    use pingora::protocols::ALPN;
+    if websocket {
+        // WebSocket upgrades require HTTP/1.1 end-to-end.
+        peer.options.alpn = ALPN::H1;
+        peer.options.idle_timeout = None;
+    } else {
+        peer.options.idle_timeout = Some(UPSTREAM_IDLE_TIMEOUT);
+        peer.options.alpn = upstream.http_version.to_alpn(upstream.tls);
+    }
     if let Some(path) = &upstream.ca_path {
         let ca = ROOT_CA.get_or_try_init(|| load_ca(path))?;
         peer.options.ca = Some(Arc::clone(ca));

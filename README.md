@@ -104,6 +104,55 @@ configs/
 
 Exact hostnames win over wildcards when both could match.
 
+### Listeners (http / https)
+
+Sites default to the **HTTP** listener only. Enable HTTPS (or both) with `listen`:
+
+```yaml
+listen: https   # TLS only (also: 443)
+listen: both    # HTTP + HTTPS
+# listen: http  # default (also: 80)
+```
+
+Same hostname can be split across two YAMLs (one `listen: http`, one `listen: https`).
+
+Force HTTP → HTTPS with a 308 (keep path and query):
+
+```yaml
+listen: both
+redirect_https: true
+```
+
+ACME HTTP-01 challenges are answered before this redirect.
+
+### WebSocket (ws / wss)
+
+Sites default to **regular HTTP traffic only**. Enable WebSocket with `traffic`:
+
+```yaml
+# Same upstream for HTTP + WebSocket:
+traffic: both
+
+# Or WebSocket-only site (can share a domain with an http-only YAML):
+traffic: websocket
+```
+
+```yaml
+enabled: true
+domains:
+  - app.example.com
+listen: both
+traffic: both
+proxy:
+  mode: load_balanced
+  upstreams:
+    - instance: 127.0.0.1:8080
+    - instance: 127.0.0.1:8081
+  health_check: true
+```
+
+Clients connect with `ws://` or `wss://` (TLS terminates on Konnector when HTTPS is enabled). Logs include `websocket=true`.
+
 Set in `/etc/konnector.env`:
 
 ```text

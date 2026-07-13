@@ -1,7 +1,7 @@
 use super::{routing::snapshot, routing::SharedRouting, RequestContext};
 use crate::{
-    access_control, cache_policy, default_site, domain_routing, error_pages,
-    forwarding, health_check, http3, path_rewrite, redirects, request_logging, upstreams,
+    access_control, cache_policy, default_site, domain_routing, error_pages, forwarding,
+    health_check, http3, path_rewrite, redirects, request_logging, upstreams, websocket,
 };
 use async_trait::async_trait;
 use pingora::{cache::CacheKey, prelude::*, proxy::FailToProxy};
@@ -27,8 +27,14 @@ impl ProxyHttp for DomainProxy {
     }
 
     async fn early_request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
-        session.set_keepalive(Some(DOWNSTREAM_KEEPALIVE_SECS));
         ctx.mark_started();
+        if websocket::is_upgrade_request(session) {
+            ctx.websocket = true;
+            // Keepalive must be off for upgraded tunnels.
+            session.set_keepalive(None);
+        } else {
+            session.set_keepalive(Some(DOWNSTREAM_KEEPALIVE_SECS));
+        }
         Ok(())
     }
 
@@ -59,6 +65,10 @@ impl ProxyHttp for DomainProxy {
         if access_control::reject_disallowed(session, ctx, &routing.sites).await? {
             return Ok(true);
         }
+        // WebSocket upgrades are HTTP/1.1 only — skip the HTTP/3 client path.
+        if ctx.websocket {
+            return Ok(false);
+        }
         http3::proxy_if_needed(
             session,
             ctx,
@@ -75,6 +85,9 @@ impl ProxyHttp for DomainProxy {
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         ctx.mark_proxied();
+        if websocket::is_upgrade_request(session) {
+            ctx.websocket = true;
+        }
         let routing = snapshot(&self.routing);
         let site_index = ctx
             .site
@@ -107,7 +120,9 @@ impl ProxyHttp for DomainProxy {
         let routing = snapshot(&self.routing);
         forwarding::apply(session, request, ctx, &routing.sites).await?;
         upstreams::apply_request_transform(&routing.sites, request, ctx).await?;
-        path_rewrite::prepare(session, ctx, &routing.sites).await;
+        if !ctx.websocket {
+            path_rewrite::prepare(session, ctx, &routing.sites).await;
+        }
         Ok(())
     }
 
@@ -117,6 +132,9 @@ impl ProxyHttp for DomainProxy {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        if ctx.websocket {
+            return Ok(());
+        }
         path_rewrite::upstream_response_filter(upstream_response, ctx).await
     }
 
@@ -127,10 +145,16 @@ impl ProxyHttp for DomainProxy {
         end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<std::time::Duration>> {
+        if ctx.websocket {
+            return Ok(None);
+        }
         path_rewrite::upstream_response_body_filter(body, end_of_stream, ctx)
     }
 
     fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()> {
+        if ctx.websocket || websocket::is_upgrade_request(session) {
+            return Ok(());
+        }
         let routing = snapshot(&self.routing);
         cache_policy::configure_request(session, ctx, &routing.sites)
     }
