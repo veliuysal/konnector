@@ -81,7 +81,7 @@ pub fn validate_server(root: &ServerConfig, sites: &[SiteConfig]) -> Result<(), 
         if !auto {
             if !cert_exists {
                 return Err(format!(
-                    "HTTPS certificate file does not exist: {} (set tls.auto: true to obtain it)",
+                    "HTTPS certificate file does not exist: {} (HTTPS auto-issues certs when enabled; check CLOUDFLARE_API_TOKEN or Let's Encrypt / port 80)",
                     https.certificate_path
                 ));
             }

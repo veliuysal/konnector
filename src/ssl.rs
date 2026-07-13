@@ -125,8 +125,14 @@ pub fn ensure_valid_certificate(
                         "auto certificate fetch failed ({refresh_error}); \
                          installing temporary self-signed cert so HTTPS can still listen"
                     );
-                    let _ = crate::acme::prepare_for_startup(https, &domains, provider)?;
-                    Ok(())
+                    match crate::acme::prepare_for_startup(https, &domains, provider) {
+                        Ok(_) => Ok(()),
+                        Err(placeholder_error) => Err(format!(
+                            "cannot install temporary certificate under {}: {placeholder_error} \
+                             (ensure TLS_DIR is writable by the konnector user)",
+                            provider.tls_dir.as_deref().unwrap_or("/etc/ssl/konnector")
+                        )),
+                    }
                 }
             }
         }

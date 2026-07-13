@@ -46,10 +46,19 @@ pub fn run() {
     }
     let provider = root.tls_provider.clone();
     let mut acme_bootstrap = false;
+    let mut https_ready = root.https.clone();
     if let Some(https) = &root.https {
-        ssl::ensure_valid_certificate(https, &sites, &provider)
-            .unwrap_or_else(|error| panic!("TLS certificate error: {error}"));
-        if provider.resolve(&sites) == configs::TlsProviderKind::Acme {
+        match ssl::ensure_valid_certificate(https, &sites, &provider) {
+            Ok(()) => {}
+            Err(error) => {
+                log::error!(
+                    "TLS certificate setup failed: {error}; \
+                     continuing with HTTP only (fix CLOUDFLARE_API_TOKEN / TLS_DIR permissions)"
+                );
+                https_ready = None;
+            }
+        }
+        if https_ready.is_some() && provider.resolve(&sites) == configs::TlsProviderKind::Acme {
             if sites.iter().any(|site| {
                 matches!(site.forwarding, configs::ForwardingConfig::Cloudflare)
             }) && provider
@@ -95,9 +104,11 @@ pub fn run() {
     let tcp_manager = TcpProxyManager::new();
     tcp_manager.apply(validation::filter_valid_tcp(configs::load_tcp_lenient()), root.logging);
     config_watcher::start(routing.clone(), tcp_manager.clone());
-    ssl_watcher::start(root.clone(), sites.clone());
+    if https_ready.is_some() {
+        ssl_watcher::start(root.clone(), sites.clone());
+    }
     if acme_bootstrap {
-        if let Some(https) = root.https.clone() {
+        if let Some(https) = https_ready.clone() {
             crate::acme::start_background_issuer(
                 https,
                 ssl::proxied_tls_domains(&sites),
@@ -109,19 +120,30 @@ pub fn run() {
     let mut service = http_proxy_service(&server.configuration, DomainProxy::new(routing));
     assert_port_available(&root.http_listen);
     service.add_tcp(&root.http_listen);
-    if let Some(https) = root.https {
+    if let Some(https) = https_ready {
         log::info!(
             "HTTPS enabled on {} using certificate {}",
             root.https_listen,
             https.certificate_path
         );
-        let mut tls = pingora::listeners::tls::TlsSettings::intermediate(
+        match pingora::listeners::tls::TlsSettings::intermediate(
             &https.certificate_path,
             &https.private_key_path,
-        )
-        .unwrap_or_else(|error| panic!("cannot load HTTPS certificate from {}: {error}", https.certificate_path));
-        tls.enable_h2();
-        service.add_tls_with_settings(&root.https_listen, None, tls);
+        ) {
+            Ok(mut tls) => {
+                tls.enable_h2();
+                service.add_tls_with_settings(&root.https_listen, None, tls);
+            }
+            Err(error) => {
+                log::error!(
+                    "cannot load HTTPS certificate from {}: {error}; \
+                     listening on HTTP only",
+                    https.certificate_path
+                );
+            }
+        }
+    } else {
+        log::warn!("HTTPS listener disabled until certificates are available");
     }
     server.add_service(service);
     server.run_forever();

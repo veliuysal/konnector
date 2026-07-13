@@ -126,6 +126,7 @@ impl Default for ListenMode {
 }
 
 impl ListenMode {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn http_only() -> Self {
         Self {
             http: true,
@@ -133,6 +134,7 @@ impl ListenMode {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn https_only() -> Self {
         Self {
             http: false,
@@ -187,6 +189,7 @@ impl TrafficMode {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn websocket_only() -> Self {
         Self {
             http: false,
@@ -568,9 +571,9 @@ fn config_stem(path: &Path) -> String {
 struct RootTlsConfig {
     #[serde(default)]
     enabled: bool,
-    /// When true, obtain/renew Let's Encrypt certs into `TLS_DIR`.
-    /// When false, the server only reads existing files from `TLS_DIR`.
+    /// Accepted for backward compatibility with older `tls.auto` YAML; issuance is automatic now.
     #[serde(default)]
+    #[allow(dead_code)]
     auto: bool,
     #[serde(default)]
     staging: bool,
@@ -579,7 +582,6 @@ struct RootTlsConfig {
 #[derive(Clone, Debug, Default)]
 struct RootTlsSettings {
     enabled: bool,
-    auto: bool,
     staging: bool,
 }
 
@@ -587,7 +589,6 @@ impl From<RootTlsConfig> for RootTlsSettings {
     fn from(config: RootTlsConfig) -> Self {
         Self {
             enabled: config.enabled,
-            auto: config.auto,
             staging: config.staging,
         }
     }
@@ -1422,7 +1423,7 @@ tls:
         .unwrap();
         let settings = RootSettings::try_from(root).unwrap();
         assert!(settings.tls.enabled);
-        assert!(settings.tls.auto);
+        assert!(settings.tls.staging);
 
         env::set_var("TLS_DIR", "/data/certs");
         let (https, provider) = resolve_tls_config(&settings.tls);
