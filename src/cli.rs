@@ -390,17 +390,43 @@ fn is_zip_package(source: &str) -> bool {
 
 #[cfg(unix)]
 fn install_deb_package(path: &Path) -> Result<(), String> {
-    run_command("apt-get", &["update"])?;
-    run_command(
-        "apt-get",
-        &[
-            "install",
-            "-y",
-            "-o",
-            "DEBIAN_FRONTEND=noninteractive",
-            path.to_str().ok_or("invalid deb path")?,
-        ],
-    )
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| format!("invalid deb path: {}", path.display()))?;
+    println!("Installing local package {}", path.display());
+
+    // Prefer dpkg -i so a same-version .deb is still applied. `apt-get install
+    // /tmp/foo.deb` often prints "already the newest version" and skips the file.
+    match run_command("dpkg", &["-i", path_str]) {
+        Ok(()) => {
+            run_command(
+                "apt-get",
+                &[
+                    "install",
+                    "-y",
+                    "-f",
+                    "-o",
+                    "DEBIAN_FRONTEND=noninteractive",
+                ],
+            )
+            .ok();
+            Ok(())
+        }
+        Err(_) => {
+            println!("Fixing dependencies, then retrying package install...");
+            run_command(
+                "apt-get",
+                &[
+                    "install",
+                    "-y",
+                    "-f",
+                    "-o",
+                    "DEBIAN_FRONTEND=noninteractive",
+                ],
+            )?;
+            run_command("dpkg", &["-i", path_str])
+        }
+    }
 }
 
 fn install_package(source: &str) -> Result<(), String> {
@@ -600,23 +626,43 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
     let source = resolve_release_source(reference.as_deref())?;
     println!("Installing from: {source}");
     install_package(&source)?;
-    if platform_ops::service_installed() {
-        platform_ops::cmd_enable().ok();
-    }
-    println!("Konnector installed.");
-    Ok(())
+    finish_service_after_package("installed")
 }
 
 fn cmd_update(args: &[String]) -> Result<(), String> {
     platform_ops::require_elevated("update")?;
     let reference = parse_release_reference(args)?;
+    let label = reference
+        .as_deref()
+        .unwrap_or("latest");
+    println!("Updating konnector ({label})...");
     let source = resolve_release_source(reference.as_deref())?;
-    println!("Updating from: {source}");
+    println!("Downloading: {source}");
     install_package(&source)?;
-    if platform_ops::package_or_runtime_installed() {
+    finish_service_after_package("updated")
+}
+
+fn finish_service_after_package(action: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Ok(version) = platform_ops::installed_package_version() {
+        println!("Installed package version: {version}");
+    }
+    #[cfg(windows)]
+    {
+        let _ = platform_ops::installed_package_version;
+    }
+    if platform_ops::service_installed() {
+        platform_ops::cmd_enable().ok();
+        println!("Restarting service...");
+        if platform_ops::cmd_restart().is_err() {
+            platform_ops::cmd_start()?;
+        }
+        platform_ops::cmd_status().ok();
+    } else if platform_ops::package_or_runtime_installed() {
+        println!("Restarting service...");
         platform_ops::cmd_restart().ok();
     }
-    println!("Konnector updated.");
+    println!("Konnector {action}.");
     Ok(())
 }
 

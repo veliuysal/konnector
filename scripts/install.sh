@@ -40,7 +40,10 @@ fi
 
 TMP="$(mktemp /tmp/konnector.XXXXXX.deb)"
 curl -fsSL -o "${TMP}" "${DEB_URL}"
-apt-get install -y "${TMP}"
+# Force the local file even when the same package version is already installed.
+# `apt-get install ${TMP}` can print "already the newest version" and skip it.
+dpkg -i "${TMP}" || apt-get install -y -f -o DEBIAN_FRONTEND=noninteractive
+dpkg -i "${TMP}"
 rm -f "${TMP}"
 
 if [ -x /opt/konnector/current/konnector ]; then

@@ -345,26 +345,33 @@ pub fn install_cli_link() -> Result<(), String> {
 
 #[cfg(unix)]
 pub fn grant_bind_capability(binary: &Path) -> Result<(), String> {
-    run_command(
-        "apt-get",
-        &[
-            "install",
-            "-y",
-            "-o",
-            "DEBIAN_FRONTEND=noninteractive",
-            "libcap2-bin",
-        ],
-    )
-    .ok();
     let path = binary
         .to_str()
         .ok_or("invalid binary path for capability grant")?;
-    if run_command("setcap", &["cap_net_bind_service=+ep", path]).is_err() {
-        eprintln!(
-            "warning: could not grant port 80/443 binding to {path}; \
-             ensure konnector runs under systemd"
-        );
+    if run_command("setcap", &["cap_net_bind_service=+ep", path]).is_ok() {
+        return Ok(());
     }
+    // Install setcap only when missing; avoid apt-get on every package configure.
+    if !Path::new("/sbin/setcap").is_file() && !Path::new("/usr/sbin/setcap").is_file() {
+        run_command(
+            "apt-get",
+            &[
+                "install",
+                "-y",
+                "-o",
+                "DEBIAN_FRONTEND=noninteractive",
+                "libcap2-bin",
+            ],
+        )
+        .ok();
+        if run_command("setcap", &["cap_net_bind_service=+ep", path]).is_ok() {
+            return Ok(());
+        }
+    }
+    eprintln!(
+        "warning: could not grant port 80/443 binding to {path}; \
+         ensure konnector runs under systemd"
+    );
     Ok(())
 }
 
@@ -476,6 +483,11 @@ pub fn package_or_runtime_installed() -> bool {
     let package_ok = run_output("dpkg-query", &["-W", "-f=${Status}", "konnector"])
         .is_ok_and(|status| status.contains("install ok installed"));
     package_ok || paths::current_binary().is_file()
+}
+
+#[cfg(unix)]
+pub fn installed_package_version() -> Result<String, String> {
+    run_output("dpkg-query", &["-W", "-f=${Version}", "konnector"])
 }
 
 #[cfg(unix)]
@@ -1003,6 +1015,11 @@ pub fn extract_archive(archive: &Path, destination: &Path) -> Result<(), String>
 #[cfg(windows)]
 pub fn package_or_runtime_installed() -> bool {
     service_installed() || paths::current_binary().is_file()
+}
+
+#[cfg(windows)]
+pub fn installed_package_version() -> Result<String, String> {
+    Err("package version is only available on Linux".into())
 }
 
 #[cfg(windows)]
