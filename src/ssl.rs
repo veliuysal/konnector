@@ -61,45 +61,21 @@ pub fn cloudflare_hostnames(domains: &[String]) -> Vec<String> {
     let mut hostnames = HashSet::new();
     for domain in domains {
         let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        if normalized.is_empty() {
+        if normalized.is_empty() || crate::domain_routing::is_wildcard(&normalized) {
+            if crate::domain_routing::is_wildcard(&normalized) {
+                hostnames.insert(normalized);
+            }
             continue;
         }
-        let Some(apex) = zone_apex(&normalized) else {
-            hostnames.insert(normalized);
-            continue;
-        };
-        // Standard Origin CA set: apex + first-level wildcard.
-        hostnames.insert(apex.clone());
-        hostnames.insert(format!("*.{apex}"));
-        // Names deeper than *.apex (e.g. www.reg.kon.ag) must be listed explicitly.
-        if is_deeper_than_single_wildcard(&normalized, &apex) {
-            hostnames.insert(normalized);
-        }
+        // Only names the site configures — do not invent a parent apex like `kon.ag`
+        // for `reg.kon.ag` (CF zone may be the subdomain; inventing apex causes error 1010).
+        hostnames.insert(normalized.clone());
+        // Cover first-level children of this hostname when it is itself a zone apex.
+        hostnames.insert(format!("*.{normalized}"));
     }
     let mut list: Vec<_> = hostnames.into_iter().collect();
     list.sort();
     list
-}
-
-/// Best-effort registrable zone (`reg.kon.ag` / `www.reg.kon.ag` → `kon.ag`).
-fn zone_apex(domain: &str) -> Option<String> {
-    let labels: Vec<_> = domain.split('.').filter(|label| !label.is_empty()).collect();
-    if labels.len() < 2 {
-        return None;
-    }
-    Some(labels[labels.len() - 2..].join("."))
-}
-
-fn is_deeper_than_single_wildcard(host: &str, apex: &str) -> bool {
-    let Some(rest) = host
-        .strip_suffix(apex)
-        .and_then(|value| value.strip_suffix('.'))
-    else {
-        return false;
-    };
-    // `reg.kon.ag` → rest=`reg` (covered by *.kon.ag)
-    // `www.reg.kon.ag` → rest=`www.reg` (needs explicit SAN)
-    !rest.is_empty() && rest.contains('.')
 }
 
 pub fn ensure_valid_certificate(
@@ -278,7 +254,9 @@ fn fetch_cloudflare_origin_certificate(
                 .unwrap_or_else(|_| "(empty body)".to_owned());
             return Err(format!(
                 "Cloudflare Origin CA HTTP {status}: {detail} \
-                 (token needs Zone:SSL and Certificates:Edit on the zone; hostnames must be in that zone)"
+                 (token needs Zone → SSL and Certificates → Edit on the Cloudflare zone \
+                 that owns these hostnames; for a subdomain zone list that hostname, \
+                 e.g. reg.kon.ag — do not require the parent apex)"
             ));
         }
         Err(error) => {
@@ -589,25 +567,30 @@ mod tests {
         assert_eq!(proxied_tls_domains(&sites), vec!["myapp.com".to_owned()]);
         assert_eq!(
             cloudflare_hostnames(&["example.com".to_owned(), "app.example.com".to_owned()]),
-            vec!["*.example.com".to_owned(), "example.com".to_owned()]
+            vec![
+                "*.app.example.com".to_owned(),
+                "*.example.com".to_owned(),
+                "app.example.com".to_owned(),
+                "example.com".to_owned(),
+            ]
         );
     }
 
     #[test]
-    fn cloudflare_hostnames_include_apex_for_subdomains() {
+    fn cloudflare_hostnames_follow_configured_names_not_parent_apex() {
+        // Subdomain zone `reg.kon.ag` must not invent `kon.ag` / `*.kon.ag`.
         assert_eq!(
             cloudflare_hostnames(&["reg.kon.ag".to_owned()]),
-            vec!["*.kon.ag".to_owned(), "kon.ag".to_owned()]
+            vec!["*.reg.kon.ag".to_owned(), "reg.kon.ag".to_owned()]
         );
         assert_eq!(
             cloudflare_hostnames(&["reg.kon.ag".to_owned(), "www.reg.kon.ag".to_owned()]),
             vec![
-                "*.kon.ag".to_owned(),
-                "kon.ag".to_owned(),
+                "*.reg.kon.ag".to_owned(),
+                "*.www.reg.kon.ag".to_owned(),
+                "reg.kon.ag".to_owned(),
                 "www.reg.kon.ag".to_owned(),
             ]
         );
-        assert_eq!(zone_apex("www.reg.kon.ag").as_deref(), Some("kon.ag"));
-        assert_eq!(zone_apex("kon.ag").as_deref(), Some("kon.ag"));
     }
 }
