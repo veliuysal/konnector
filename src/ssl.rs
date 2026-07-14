@@ -1,5 +1,10 @@
 use crate::configs::{ForwardingConfig, HttpsConfig, SiteConfig, TlsProviderConfig, TlsProviderKind};
-use openssl::x509::X509;
+use openssl::{
+    hash::MessageDigest,
+    pkey::PKey,
+    rsa::Rsa,
+    x509::{X509NameBuilder, X509ReqBuilder, X509},
+};
 use std::{
     cmp::Ordering,
     collections::HashSet,
@@ -59,12 +64,16 @@ pub fn cloudflare_hostnames(domains: &[String]) -> Vec<String> {
         if normalized.is_empty() {
             continue;
         }
-        hostnames.insert(normalized.clone());
-        // Origin CA is issued on the zone (apex). Subdomains alone are not enough —
-        // always include apex + wildcard so CF can issue for the main domain.
-        if let Some(apex) = zone_apex(&normalized) {
-            hostnames.insert(apex.clone());
-            hostnames.insert(format!("*.{apex}"));
+        let Some(apex) = zone_apex(&normalized) else {
+            hostnames.insert(normalized);
+            continue;
+        };
+        // Standard Origin CA set: apex + first-level wildcard.
+        hostnames.insert(apex.clone());
+        hostnames.insert(format!("*.{apex}"));
+        // Names deeper than *.apex (e.g. www.reg.kon.ag) must be listed explicitly.
+        if is_deeper_than_single_wildcard(&normalized, &apex) {
+            hostnames.insert(normalized);
         }
     }
     let mut list: Vec<_> = hostnames.into_iter().collect();
@@ -79,6 +88,18 @@ fn zone_apex(domain: &str) -> Option<String> {
         return None;
     }
     Some(labels[labels.len() - 2..].join("."))
+}
+
+fn is_deeper_than_single_wildcard(host: &str, apex: &str) -> bool {
+    let Some(rest) = host
+        .strip_suffix(apex)
+        .and_then(|value| value.strip_suffix('.'))
+    else {
+        return false;
+    };
+    // `reg.kon.ag` → rest=`reg` (covered by *.kon.ag)
+    // `www.reg.kon.ag` → rest=`www.reg` (needs explicit SAN)
+    !rest.is_empty() && rest.contains('.')
 }
 
 pub fn ensure_valid_certificate(
@@ -107,9 +128,22 @@ pub fn ensure_valid_certificate(
         Ok(()) => {
             if crate::acme::certificate_expires_within(&https.certificate_path, 30) {
                 log::info!("TLS certificate expires within 30 days; renewing");
-                refresh_certificate(https, sites, provider)?;
-                let domains = certificate_domains(sites, kind);
-                validate_certificate_files(https, &domains)?;
+                match refresh_certificate(https, sites, provider) {
+                    Ok(()) => {
+                        let domains = certificate_domains(sites, kind);
+                        if let Err(error) = validate_certificate_files(https, &domains) {
+                            log::warn!(
+                                "renewed certificate still invalid ({error}); keeping previous files"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        // Keep serving the existing (even short-lived) cert — do not disable HTTPS.
+                        log::warn!(
+                            "certificate renewal failed ({error}); continuing with existing certificate"
+                        );
+                    }
+                }
             }
             Ok(())
         }
@@ -225,16 +259,32 @@ fn fetch_cloudflare_origin_certificate(
     api_token: &str,
     hostnames: &[String],
 ) -> Result<(String, String), String> {
+    let (csr, private_key) = generate_origin_csr(hostnames)?;
     let body = serde_json::json!({
+        "csr": csr,
         "hostnames": hostnames,
         "requested_validity": DEFAULT_ORIGIN_VALIDITY_DAYS,
         "request_type": "origin-rsa",
     });
-    let response = ureq::post(CLOUDFLARE_ORIGIN_CERT_URL)
+    let response = match ureq::post(CLOUDFLARE_ORIGIN_CERT_URL)
         .set("Authorization", &format!("Bearer {api_token}"))
         .set("Content-Type", "application/json")
         .send_json(body)
-        .map_err(|error| format!("Cloudflare certificate request failed: {error}"))?;
+    {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let detail = response
+                .into_string()
+                .unwrap_or_else(|_| "(empty body)".to_owned());
+            return Err(format!(
+                "Cloudflare Origin CA HTTP {status}: {detail} \
+                 (token needs Zone:SSL and Certificates:Edit on the zone; hostnames must be in that zone)"
+            ));
+        }
+        Err(error) => {
+            return Err(format!("Cloudflare certificate request failed: {error}"));
+        }
+    };
     let status = response.status();
     let payload: serde_json::Value = response
         .into_json()
@@ -259,11 +309,43 @@ fn fetch_cloudflare_origin_certificate(
         .get("certificate")
         .and_then(serde_json::Value::as_str)
         .ok_or("Cloudflare certificate response is missing certificate")?;
-    let private_key = result
-        .get("private_key")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("Cloudflare certificate response is missing private_key")?;
-    Ok((certificate.to_owned(), private_key.to_owned()))
+    Ok((certificate.to_owned(), private_key))
+}
+
+fn generate_origin_csr(hostnames: &[String]) -> Result<(String, String), String> {
+    let rsa = Rsa::generate(2048).map_err(|error| format!("RSA key: {error}"))?;
+    let key = PKey::from_rsa(rsa).map_err(|error| format!("pkey: {error}"))?;
+    let cn = hostnames
+        .iter()
+        .find(|name| !name.starts_with("*."))
+        .map(String::as_str)
+        .or_else(|| hostnames.first().map(String::as_str))
+        .unwrap_or("konnector");
+
+    let mut name = X509NameBuilder::new().map_err(|error| format!("X509 name: {error}"))?;
+    name.append_entry_by_text("CN", cn)
+        .map_err(|error| format!("X509 CN: {error}"))?;
+    let name = name.build();
+
+    let mut req = X509ReqBuilder::new().map_err(|error| format!("CSR builder: {error}"))?;
+    req.set_subject_name(&name)
+        .map_err(|error| format!("CSR subject: {error}"))?;
+    req.set_pubkey(&key)
+        .map_err(|error| format!("CSR pubkey: {error}"))?;
+    req.sign(&key, MessageDigest::sha256())
+        .map_err(|error| format!("CSR sign: {error}"))?;
+    let csr = req.build();
+    let csr_pem = String::from_utf8(
+        csr.to_pem()
+            .map_err(|error| format!("CSR pem: {error}"))?,
+    )
+    .map_err(|error| format!("CSR utf8: {error}"))?;
+    let private_key = String::from_utf8(
+        key.private_key_to_pem_pkcs8()
+            .map_err(|error| format!("key pem: {error}"))?,
+    )
+    .map_err(|error| format!("key utf8: {error}"))?;
+    Ok((csr_pem, private_key))
 }
 
 fn run_fetch_command(command: &str, https: &HttpsConfig) -> Result<(), String> {
@@ -507,22 +589,21 @@ mod tests {
         assert_eq!(proxied_tls_domains(&sites), vec!["myapp.com".to_owned()]);
         assert_eq!(
             cloudflare_hostnames(&["example.com".to_owned(), "app.example.com".to_owned()]),
-            vec![
-                "*.example.com".to_owned(),
-                "app.example.com".to_owned(),
-                "example.com".to_owned()
-            ]
+            vec!["*.example.com".to_owned(), "example.com".to_owned()]
         );
     }
 
     #[test]
     fn cloudflare_hostnames_include_apex_for_subdomains() {
         assert_eq!(
+            cloudflare_hostnames(&["reg.kon.ag".to_owned()]),
+            vec!["*.kon.ag".to_owned(), "kon.ag".to_owned()]
+        );
+        assert_eq!(
             cloudflare_hostnames(&["reg.kon.ag".to_owned(), "www.reg.kon.ag".to_owned()]),
             vec![
                 "*.kon.ag".to_owned(),
                 "kon.ag".to_owned(),
-                "reg.kon.ag".to_owned(),
                 "www.reg.kon.ag".to_owned(),
             ]
         );
